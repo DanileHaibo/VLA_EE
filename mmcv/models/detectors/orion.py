@@ -780,103 +780,352 @@ class Orion(MVXTwoStageDetector):
                 if self.use_gen_token and special_token_inputs: # must be the final round conversation
                     history_input_output_id.append(input_ids)
                     context_input_ids = torch.cat(history_input_output_id,dim=-1)
-                    ego_feature = self.lm_head.inference_ego(
-                        inputs=context_input_ids,
-                        images=vision_embeded,
-                        do_sample=True,
-                        temperature=0.1,
-                        top_p=0.75,
-                        num_beams=1,
-                        max_new_tokens=320,
-                        use_cache=True,
-                        return_ego_feature=True
-                    )
-                    ego_feature = ego_feature.to(torch.float32)
-                    current_states = ego_feature.unsqueeze(1)
-                    if not self.use_diff_decoder and not self.use_mlp_decoder: # VAE-based generate 
-                        distribution_comp = {}
-                        noise = None
-                        self.fut_ts = 6
-                        if self.PROBABILISTIC:
-                            # Do probabilistic computation
-                            sample, output_distribution = self.distribution_forward(
-                                current_states, None, noise
-                            )
-                            distribution_comp = {**distribution_comp, **output_distribution}
-
-                        # 2. predict future state from distribution
-                        hidden_states = ego_feature.unsqueeze(1)
-                        states_hs, future_states_hs = \
-                            self.future_states_predict(B, sample, hidden_states, current_states)
-
-                        ego_query_hs = \
-                            states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
-                        ego_fut_trajs_list = []
-                        for i in range(self.fut_ts):
-                            outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
-                            ego_fut_trajs_list.append(outputs_ego_trajs)
-
-                        ego_fut_preds = torch.stack(ego_fut_trajs_list, dim=2)
-                    elif self.use_diff_decoder:
-                        step_num = 2
-                        bs = ego_feature.shape[0]
-                        device = ego_feature.device
-                        self.diffusion_scheduler.set_timesteps(1000, device)
-                        step_ratio = 20 / step_num
-                        roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
-                        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
-
-                        # 1. add truncated noise to the plan anchor
-                        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
-                        img = self.norm_odo(plan_anchor)
-                        noise = torch.randn(img.shape, device=device)
-                        trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
-                        img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
-                        noisy_trajs = self.denorm_odo(img)
-                        ego_fut_mode = img.shape[1]
-                        for k in roll_timesteps[:]:
-                            x_boxes = torch.clamp(img, min=-1, max=1)
-                            noisy_traj_points = self.denorm_odo(x_boxes)
-
-                            # 2. proj noisy_traj_points to the query
-                            traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=512)
-                            traj_pos_embed = traj_pos_embed.flatten(-2)
-                            traj_feature = self.plan_anchor_encoder(traj_pos_embed)
-                            traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
-
-                            timesteps = k
-                            if not torch.is_tensor(timesteps):
-                                # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-                                timesteps = torch.tensor([timesteps], dtype=torch.long, device=img.device)
-                            elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-                                timesteps = timesteps[None].to(img.device)
+                    
+                    # Early exit: 从第16层开始逐层评估，使用回调机制实现真正的early exit
+                    enable_early_exit = not (self.fp16_infer or self.fp32_infer) or self.fp16_eval  # 只在评估模式下启用
+                    early_exit_threshold = 0.5  # L2 2s metrics阈值
+                    early_exit_start_layer = 16  # 从第16层开始
+                    
+                    # 用于存储early exit的结果
+                    early_exit_result = {
+                        'triggered': False,
+                        'ego_feature': None,
+                        'ego_fut_preds': None,
+                        'layer_idx': None
+                    }
+                    
+                    if enable_early_exit:
+                        print(f"[Early Exit] Enabled: Starting from layer {early_exit_start_layer}, threshold={early_exit_threshold}")
+                        
+                        # 准备ground truth用于计算metrics
+                        if not (self.fp16_infer or self.fp32_infer) or self.fp16_eval:
+                            ego_fut_trajs_gt = data['ego_fut_trajs'][0, 0].cumsum(dim=-2) if fut_valid_flag else None
+                            gt_bbox_for_metric = gt_bbox if 'gt_bboxes_3d' in data else None
+                            gt_attr_label_for_metric = gt_attr_label.unsqueeze(0) if 'gt_attr_labels' in data else None
+                        else:
+                            ego_fut_trajs_gt = None
+                            gt_bbox_for_metric = None
+                            gt_attr_label_for_metric = None
+                        
+                        # 先调用prepare_inputs_labels_for_multimodal获取new_input_ids，用于在回调中计算loc_positions
+                        # 这样loc_positions的形状就能匹配hidden_states的实际形状
+                        _, _, _, _, _, _, new_input_ids_for_callback = self.lm_head.prepare_inputs_labels_for_multimodal(
+                            context_input_ids,
+                            None,  # position_ids
+                            None,  # attention_mask
+                            None,  # past_key_values
+                            None,  # labels
+                            vision_embeded,
+                            None   # image_sizes
+                        )
+                        
+                        # 获取waypoint token位置（基于new_input_ids，形状匹配hidden_states）
+                        if not isinstance(self.lm_head.config.waypoint_token_idx, list):
+                            loc_positions = (new_input_ids_for_callback == self.lm_head.config.waypoint_token_idx)
+                        else:
+                            loc_positions_list = []
+                            for new_id in new_input_ids_for_callback:
+                                loc_positions = torch.zeros_like(new_id).to(torch.bool)
+                                for token_id in self.lm_head.config.waypoint_token_idx:
+                                    if token_id in new_id:
+                                        loc_positions = torch.logical_or(loc_positions, new_id == token_id)
+                                loc_positions_list.append(loc_positions)
+                            loc_positions = torch.stack(loc_positions_list, dim=0)
+                        
+                        # 定义early exit回调函数
+                        def early_exit_callback(hidden_states, layer_idx):
+                            """回调函数：在每一层后检查是否应该early exit"""
+                            # 只从第16层开始检查
+                            if layer_idx < early_exit_start_layer - 1:
+                                return False
                             
-                            # 3. embed the timesteps
-                            timesteps = timesteps.expand(img.shape[0])
-                            time_embed = self.time_mlp(timesteps)
-                            time_embed = time_embed.view(bs,1,-1)
+                            try:
+                                # 提取ego feature
+                                # 确保loc_positions的形状与hidden_states匹配
+                                batch_size, seq_len, _ = hidden_states.shape
+                                if loc_positions.shape[1] != seq_len:
+                                    # 如果形状不匹配，重新计算loc_positions
+                                    if not isinstance(self.lm_head.config.waypoint_token_idx, list):
+                                        # 使用new_input_ids_for_callback重新计算
+                                        loc_positions_actual = (new_input_ids_for_callback == self.lm_head.config.waypoint_token_idx)
+                                    else:
+                                        loc_positions_list = []
+                                        for new_id in new_input_ids_for_callback:
+                                            loc_positions_actual = torch.zeros_like(new_id).to(torch.bool)
+                                            for token_id in self.lm_head.config.waypoint_token_idx:
+                                                if token_id in new_id:
+                                                    loc_positions_actual = torch.logical_or(loc_positions_actual, new_id == token_id)
+                                            loc_positions_list.append(loc_positions_actual)
+                                        loc_positions_actual = torch.stack(loc_positions_list, dim=0)
+                                    # 调整形状以匹配hidden_states
+                                    if loc_positions_actual.shape[1] < seq_len:
+                                        # 如果new_input_ids较短，需要padding
+                                        padding = torch.zeros((batch_size, seq_len - loc_positions_actual.shape[1]), 
+                                                            dtype=torch.bool, device=loc_positions_actual.device)
+                                        loc_positions_actual = torch.cat([loc_positions_actual, padding], dim=1)
+                                    elif loc_positions_actual.shape[1] > seq_len:
+                                        # 如果new_input_ids较长，需要截断
+                                        loc_positions_actual = loc_positions_actual[:, :seq_len]
+                                    loc_positions_to_use = loc_positions_actual
+                                else:
+                                    loc_positions_to_use = loc_positions
+                                
+                                selected_hidden_states = hidden_states[loc_positions_to_use.to(device=hidden_states.device)]
+                                ego_feature_layer = selected_hidden_states.to(torch.float32)
+                                current_states_layer = ego_feature_layer.unsqueeze(1)
+                                
+                                # 生成预测轨迹
+                                if not self.use_diff_decoder and not self.use_mlp_decoder:  # VAE-based generate
+                                    distribution_comp = {}
+                                    noise = None
+                                    self.fut_ts = 6
+                                    if self.PROBABILISTIC:
+                                        sample, output_distribution = self.distribution_forward(
+                                            current_states_layer, None, noise
+                                        )
+                                    else:
+                                        sample = current_states_layer
 
-                            # 4. begin the stacked decoder
-                            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, current_states, time_embed)
-                            poses_reg = poses_reg_list[-1]
-                            poses_cls = poses_cls_list[-1]
-                            x_start = poses_reg[...,:2]
-                            x_start = self.norm_odo(x_start)
-                            img = self.diffusion_scheduler.step(
-                                model_output=x_start,
-                                timestep=k,
-                                sample=img
-                            ).prev_sample
-                        mode_idx = poses_cls.argmax(dim=-1)
-                        mode_masks = torch.zeros(*poses_cls.shape[:2],device=poses_cls.device)
-                        for mask, idx in zip(mode_masks, mode_idx):
-                            mask[idx] = 1
-                        mode_masks = mode_masks.to(torch.bool)
-                        # best_reg = poses_reg[mode_masks]
-                        ego_fut_preds = poses_reg
-                    elif self.use_mlp_decoder:
-                        waypoint = self.waypoint_decoder(current_states)
-                        waypoint = waypoint.reshape(-1,2)
+                                    # 2. predict future state from distribution
+                                    # 确保所有输入都是float32类型，避免dtype不匹配
+                                    hidden_states_hs = ego_feature_layer.unsqueeze(1).to(torch.float32)
+                                    sample = sample.to(torch.float32) if sample is not None else current_states_layer.to(torch.float32)
+                                    current_states_layer = current_states_layer.to(torch.float32)
+                                    states_hs, future_states_hs = \
+                                        self.future_states_predict(B, sample, hidden_states_hs, current_states_layer)
+
+                                    ego_query_hs = \
+                                        states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
+                                    ego_fut_trajs_list = []
+                                    for i in range(self.fut_ts):
+                                        outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
+                                        ego_fut_trajs_list.append(outputs_ego_trajs)
+
+                                    ego_fut_preds_layer = torch.stack(ego_fut_trajs_list, dim=2)  # (B, ego_fut_mode, fut_ts, 2)
+                                    mask_active_cmd = data['ego_fut_cmd'][:,0,0] == 1
+                                    ego_fut_preds_layer_filtered = ego_fut_preds_layer[mask_active_cmd].flatten(0,1).to('cpu')
+                                    ego_fut_pred_layer = ego_fut_preds_layer_filtered.cumsum(dim=-2)
+                                elif self.use_mlp_decoder:
+                                    waypoint = self.waypoint_decoder(current_states_layer)
+                                    waypoint = waypoint.reshape(-1, 2)
+                                    ego_fut_pred_layer = waypoint.to('cpu')
+                                else:
+                                    # 对于diff_decoder，暂时跳过early exit
+                                    return False
+                                
+                                # 计算L2 2s metrics
+                                if ego_fut_trajs_gt is not None and fut_valid_flag:
+                                    metric_dict_layer = self.compute_planner_metric_stp3(
+                                        pred_ego_fut_trajs=ego_fut_pred_layer[None].to('cpu'),
+                                        gt_ego_fut_trajs=ego_fut_trajs_gt[None].to('cpu'),
+                                        gt_agent_boxes=gt_bbox_for_metric,
+                                        gt_agent_feats=gt_attr_label_for_metric,
+                                        fut_valid_flag=fut_valid_flag
+                                    )
+                                    l2_2s = metric_dict_layer.get('plan_L2_2s', float('inf'))
+                                    l2_1s = metric_dict_layer.get('plan_L2_1s', float('inf'))
+                                    l2_3s = metric_dict_layer.get('plan_L2_3s', float('inf'))
+                                    
+                                    # 打印当前层的metrics分数
+                                    current_layer_num = layer_idx + 1  # layer_idx从0开始
+                                    print(f"[Early Exit] Layer {current_layer_num}: L2_1s={l2_1s:.4f}, L2_2s={l2_2s:.4f}, L2_3s={l2_3s:.4f}, threshold={early_exit_threshold:.4f}")
+                                    
+                                    # 如果L2 2s < threshold，则early exit
+                                    if l2_2s < early_exit_threshold:
+                                        print(f"[Early Exit] ✓ Triggered at Layer {current_layer_num}! L2_2s={l2_2s:.4f} < {early_exit_threshold:.4f}")
+                                        early_exit_result['triggered'] = True
+                                        early_exit_result['ego_feature'] = ego_feature_layer
+                                        early_exit_result['layer_idx'] = layer_idx
+                                        if not self.use_mlp_decoder:
+                                            early_exit_result['ego_fut_preds'] = ego_fut_preds_layer  # 保持完整格式
+                                        else:
+                                            early_exit_result['ego_fut_preds'] = waypoint
+                                        return True  # 触发early exit
+                                return False
+                            except Exception as e:
+                                # 如果计算metrics失败，继续下一层
+                                print(f"[Early Exit] Warning: Failed to compute metrics for Layer {layer_idx + 1}: {str(e)}")
+                                return False
+                        
+                        # 设置回调函数
+                        # 获取底层的LlavaLlamaModel实例
+                        if hasattr(self.lm_head, 'get_model'):
+                            llama_model = self.lm_head.get_model()
+                        elif hasattr(self.lm_head, 'model'):
+                            llama_model = self.lm_head.model
+                        else:
+                            raise AttributeError(f"self.lm_head ({type(self.lm_head)}) has neither 'get_model' nor 'model' attribute")
+                        
+                        # 类型检查
+                        from mmcv.utils.llava_llama import LlavaLlamaModel
+                        if not isinstance(llama_model, LlavaLlamaModel):
+                            raise TypeError(f"Expected LlavaLlamaModel, but got {type(llama_model)}. "
+                                          f"self.lm_head type: {type(self.lm_head)}, "
+                                          f"self.lm_head.model type: {type(getattr(self.lm_head, 'model', None))}")
+                        
+                        if not hasattr(llama_model, 'set_early_exit_callback'):
+                            raise AttributeError(f"LlavaLlamaModel {type(llama_model)} does not have set_early_exit_callback method.")
+                        
+                        llama_model.set_early_exit_callback(early_exit_callback)
+                        llama_model.early_exit_start_layer = early_exit_start_layer
+                        
+                        # 调用inference_ego，模型会在forward过程中逐层检查并可能提前退出
+                        ego_feature = self.lm_head.inference_ego(
+                            inputs=context_input_ids,
+                            images=vision_embeded,
+                            do_sample=True,
+                            temperature=0.1,
+                            top_p=0.75,
+                            num_beams=1,
+                            max_new_tokens=320,
+                            use_cache=False,  # early exit时不需要cache
+                            return_ego_feature=True
+                        )
+                        
+                        # 清除回调函数
+                        if hasattr(self.lm_head, 'get_model'):
+                            llama_model = self.lm_head.get_model()
+                        else:
+                            llama_model = self.lm_head.model
+                        llama_model.set_early_exit_callback(None)
+                        
+                        # 如果触发了early exit，使用保存的结果
+                        if early_exit_result['triggered']:
+                            ego_feature = early_exit_result['ego_feature']
+                            ego_fut_preds = early_exit_result['ego_fut_preds']
+                        else:
+                            # 没有触发early exit，使用最后一层的输出
+                            final_layer_num = self.lm_head.config.num_hidden_layers
+                            print(f"[Early Exit] ✗ Not triggered, using final layer {final_layer_num}")
+                            # ego_feature已经是最后一层的输出，需要生成预测
+                            current_states = ego_feature.unsqueeze(1)
+                            if not self.use_diff_decoder and not self.use_mlp_decoder:  # VAE-based generate
+                                distribution_comp = {}
+                                noise = None
+                                self.fut_ts = 6
+                                if self.PROBABILISTIC:
+                                    sample, output_distribution = self.distribution_forward(
+                                        current_states, None, noise
+                                    )
+                                    distribution_comp = {**distribution_comp, **output_distribution}
+                                else:
+                                    sample = current_states
+
+                                hidden_states = ego_feature.unsqueeze(1)
+                                states_hs, future_states_hs = \
+                                    self.future_states_predict(B, sample, hidden_states, current_states)
+
+                                ego_query_hs = \
+                                    states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
+                                ego_fut_trajs_list = []
+                                for i in range(self.fut_ts):
+                                    outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
+                                    ego_fut_trajs_list.append(outputs_ego_trajs)
+
+                                ego_fut_preds = torch.stack(ego_fut_trajs_list, dim=2)
+                            elif self.use_mlp_decoder:
+                                waypoint = self.waypoint_decoder(current_states)
+                                waypoint = waypoint.reshape(-1, 2)
+                                ego_fut_preds = waypoint
+                    else:
+                        # 不使用early exit，使用原有逻辑
+                        ego_feature = self.lm_head.inference_ego(
+                            inputs=context_input_ids,
+                            images=vision_embeded,
+                            do_sample=True,
+                            temperature=0.1,
+                            top_p=0.75,
+                            num_beams=1,
+                            max_new_tokens=320,
+                            use_cache=True,
+                            return_ego_feature=True
+                        )
+                        ego_feature = ego_feature.to(torch.float32)
+                        current_states = ego_feature.unsqueeze(1)
+                        if not self.use_diff_decoder and not self.use_mlp_decoder: # VAE-based generate 
+                            distribution_comp = {}
+                            noise = None
+                            self.fut_ts = 6
+                            if self.PROBABILISTIC:
+                                # Do probabilistic computation
+                                sample, output_distribution = self.distribution_forward(
+                                    current_states, None, noise
+                                )
+                                distribution_comp = {**distribution_comp, **output_distribution}
+
+                            # 2. predict future state from distribution
+                            hidden_states = ego_feature.unsqueeze(1)
+                            states_hs, future_states_hs = \
+                                self.future_states_predict(B, sample, hidden_states, current_states)
+
+                            ego_query_hs = \
+                                states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
+                            ego_fut_trajs_list = []
+                            for i in range(self.fut_ts):
+                                outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
+                                ego_fut_trajs_list.append(outputs_ego_trajs)
+
+                            ego_fut_preds = torch.stack(ego_fut_trajs_list, dim=2)
+                        elif self.use_diff_decoder:
+                            step_num = 2
+                            bs = ego_feature.shape[0]
+                            device = ego_feature.device
+                            self.diffusion_scheduler.set_timesteps(1000, device)
+                            step_ratio = 20 / step_num
+                            roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
+                            roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
+
+                            # 1. add truncated noise to the plan anchor
+                            plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
+                            img = self.norm_odo(plan_anchor)
+                            noise = torch.randn(img.shape, device=device)
+                            trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
+                            img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
+                            noisy_trajs = self.denorm_odo(img)
+                            ego_fut_mode = img.shape[1]
+                            for k in roll_timesteps[:]:
+                                x_boxes = torch.clamp(img, min=-1, max=1)
+                                noisy_traj_points = self.denorm_odo(x_boxes)
+
+                                # 2. proj noisy_traj_points to the query
+                                traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=512)
+                                traj_pos_embed = traj_pos_embed.flatten(-2)
+                                traj_feature = self.plan_anchor_encoder(traj_pos_embed)
+                                traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
+
+                                timesteps = k
+                                if not torch.is_tensor(timesteps):
+                                    # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+                                    timesteps = torch.tensor([timesteps], dtype=torch.long, device=img.device)
+                                elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+                                    timesteps = timesteps[None].to(img.device)
+                                
+                                # 3. embed the timesteps
+                                timesteps = timesteps.expand(img.shape[0])
+                                time_embed = self.time_mlp(timesteps)
+                                time_embed = time_embed.view(bs,1,-1)
+
+                                # 4. begin the stacked decoder
+                                poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, current_states, time_embed)
+                                poses_reg = poses_reg_list[-1]
+                                poses_cls = poses_cls_list[-1]
+                                x_start = poses_reg[...,:2]
+                                x_start = self.norm_odo(x_start)
+                                img = self.diffusion_scheduler.step(
+                                    model_output=x_start,
+                                    timestep=k,
+                                    sample=img
+                                ).prev_sample
+                            mode_idx = poses_cls.argmax(dim=-1)
+                            mode_masks = torch.zeros(*poses_cls.shape[:2],device=poses_cls.device)
+                            for mask, idx in zip(mode_masks, mode_idx):
+                                mask[idx] = 1
+                            mode_masks = mode_masks.to(torch.bool)
+                            # best_reg = poses_reg[mode_masks]
+                            ego_fut_preds = poses_reg
+                        elif self.use_mlp_decoder:
+                            waypoint = self.waypoint_decoder(current_states)
+                            waypoint = waypoint.reshape(-1,2)
                 else:
                     history_input_output_id.append(input_ids)
                     context_input_ids = torch.cat(history_input_output_id,dim=-1)
@@ -1172,10 +1421,15 @@ class Orion(MVXTwoStageDetector):
 
         future_prediction_input = sample.unsqueeze(0).expand(self.fut_ts, -1, -1, -1)
         future_prediction_input = future_prediction_input.reshape(self.fut_ts, -1, self.latent_dim)
+        # 确保输入是float32类型，避免GRU的dtype不匹配
+        future_prediction_input = future_prediction_input.to(torch.float32)
 
         hidden_states = hidden_states.permute(1,0,2) # (4, 1, 4096) -> (1, 4, 4096)
+        hidden_states = hidden_states.to(torch.float32)  # 确保是float32
         hidden_state = hidden_states.reshape(self.layer_dim, -1, int(4096/4)) # (4, 4, 1024)
-        future_states = self.predict_model(future_prediction_input, hidden_state)
+        # 确保predict_model的输入和隐藏状态都是float32类型
+        # GRU要求输入和隐藏状态的dtype必须一致
+        future_states = self.predict_model(future_prediction_input.to(torch.float32), hidden_state.to(torch.float32))
 
         current_states_hs = current_states.unsqueeze(0).repeat(6, 1, 1, 1)
         future_states_hs = future_states.reshape(self.fut_ts, batch_size, -1, future_states.shape[2])

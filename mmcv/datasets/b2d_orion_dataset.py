@@ -42,7 +42,7 @@ import math
 
 @DATASETS.register_module()
 class B2DOrionDataset(Custom3DDataset):
-    def __init__(self, queue_length=4, seq_mode=False, seq_split_num=1, overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=2, future_frames=6,point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,polyline_points_num=20,*args, eval_mode=['lane', 'det'], **kwargs):
+    def __init__(self, queue_length=4, seq_mode=False, seq_split_num=1, overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=2, future_frames=6,point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,polyline_points_num=20,dataset_percent=None,*args, eval_mode=['lane', 'det'], **kwargs):
         super().__init__(*args, **kwargs)
         self.queue_length = queue_length
         self.overlap_test = overlap_test
@@ -63,6 +63,14 @@ class B2DOrionDataset(Custom3DDataset):
         self.map_ann_file = 'data/infos'
         self.eval_cfg  = eval_cfg
         self.eval_mode = eval_mode
+        
+        # 如果指定了数据集比例，截取前 N% 的数据
+        if dataset_percent is not None and 0 < dataset_percent < 1.0:
+            total_len = len(self.data_infos)
+            subset_len = int(total_len * dataset_percent)
+            self.data_infos = self.data_infos[:subset_len]
+            print(f"Dataset limited to {dataset_percent*100:.1f}% ({subset_len}/{total_len} samples)")
+        
         with open(self.map_file,'rb') as f: 
             self.map_infos = pickle.load(f)
         if seq_mode:
