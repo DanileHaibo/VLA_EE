@@ -795,17 +795,20 @@ class Orion(MVXTwoStageDetector):
                     }
                     
                     if enable_early_exit:
-                        print(f"[Early Exit] Enabled: Starting from layer {early_exit_start_layer}, threshold={early_exit_threshold}")
+                        case_start_time = time.time()
                         
-                        # 准备ground truth用于计算metrics
+                        # 准备ground truth用于计算metrics（保持在GPU上，避免CPU-GPU传输）
                         if not (self.fp16_infer or self.fp32_infer) or self.fp16_eval:
                             ego_fut_trajs_gt = data['ego_fut_trajs'][0, 0].cumsum(dim=-2) if fut_valid_flag else None
-                            gt_bbox_for_metric = gt_bbox if 'gt_bboxes_3d' in data else None
-                            gt_attr_label_for_metric = gt_attr_label.unsqueeze(0) if 'gt_attr_labels' in data else None
+                            if ego_fut_trajs_gt is not None:
+                                ego_fut_trajs_gt = ego_fut_trajs_gt.to(device=vision_embeded.device)
                         else:
                             ego_fut_trajs_gt = None
-                            gt_bbox_for_metric = None
-                            gt_attr_label_for_metric = None
+                        
+                        # 智能跳过机制：记录跳过层数，用于跳过远大于阈值的层
+                        skip_until_layer = [None]  # 使用列表以便在闭包中修改
+                        # 连续不满足阈值且无跳层的计数（用于避免metrics已降到最低，继续检查也无提升的情况）
+                        consecutive_no_skip_above_threshold = [0]  # 使用列表以便在闭包中修改
                         
                         # 先调用prepare_inputs_labels_for_multimodal获取new_input_ids，用于在回调中计算loc_positions
                         # 这样loc_positions的形状就能匹配hidden_states的实际形状
@@ -835,12 +838,19 @@ class Orion(MVXTwoStageDetector):
                         # 定义early exit回调函数
                         def early_exit_callback(hidden_states, layer_idx):
                             """回调函数：在每一层后检查是否应该early exit"""
+                            layer_start_time = time.time()
+                            
                             # 只从第16层开始检查
                             if layer_idx < early_exit_start_layer - 1:
                                 return False
                             
+                            # 智能跳过：如果设置了跳过层，且当前层小于跳过层，直接返回
+                            if skip_until_layer[0] is not None and layer_idx < skip_until_layer[0]:
+                                return False
+                            
                             try:
                                 # 提取ego feature
+                                t_extract_start = time.time()
                                 # 确保loc_positions的形状与hidden_states匹配
                                 batch_size, seq_len, _ = hidden_states.shape
                                 if loc_positions.shape[1] != seq_len:
@@ -873,78 +883,159 @@ class Orion(MVXTwoStageDetector):
                                 selected_hidden_states = hidden_states[loc_positions_to_use.to(device=hidden_states.device)]
                                 ego_feature_layer = selected_hidden_states.to(torch.float32)
                                 current_states_layer = ego_feature_layer.unsqueeze(1)
+                                t_extract = (time.time() - t_extract_start) * 1000
                                 
                                 # 生成预测轨迹
+                                t_predict_start = time.time()
                                 if not self.use_diff_decoder and not self.use_mlp_decoder:  # VAE-based generate
                                     distribution_comp = {}
                                     noise = None
                                     self.fut_ts = 6
+                                    t_dist_start = time.time()
                                     if self.PROBABILISTIC:
                                         sample, output_distribution = self.distribution_forward(
                                             current_states_layer, None, noise
                                         )
                                     else:
                                         sample = current_states_layer
+                                    t_dist = (time.time() - t_dist_start) * 1000
 
                                     # 2. predict future state from distribution
                                     # 确保所有输入都是float32类型，避免dtype不匹配
                                     hidden_states_hs = ego_feature_layer.unsqueeze(1).to(torch.float32)
                                     sample = sample.to(torch.float32) if sample is not None else current_states_layer.to(torch.float32)
                                     current_states_layer = current_states_layer.to(torch.float32)
+                                    t_fut_start = time.time()
                                     states_hs, future_states_hs = \
                                         self.future_states_predict(B, sample, hidden_states_hs, current_states_layer)
+                                    t_fut = (time.time() - t_fut_start) * 1000
 
                                     ego_query_hs = \
                                         states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
                                     ego_fut_trajs_list = []
+                                    t_dec_start = time.time()
                                     for i in range(self.fut_ts):
                                         outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
                                         ego_fut_trajs_list.append(outputs_ego_trajs)
+                                    t_dec = (time.time() - t_dec_start) * 1000
 
                                     ego_fut_preds_layer = torch.stack(ego_fut_trajs_list, dim=2)  # (B, ego_fut_mode, fut_ts, 2)
                                     mask_active_cmd = data['ego_fut_cmd'][:,0,0] == 1
-                                    ego_fut_preds_layer_filtered = ego_fut_preds_layer[mask_active_cmd].flatten(0,1).to('cpu')
-                                    ego_fut_pred_layer = ego_fut_preds_layer_filtered.cumsum(dim=-2)
+                                    ego_fut_preds_layer_filtered = ego_fut_preds_layer[mask_active_cmd].flatten(0,1)
+                                    ego_fut_pred_layer = ego_fut_preds_layer_filtered.cumsum(dim=-2)  # 保持在GPU上
+                                    t_predict = (time.time() - t_predict_start) * 1000
                                 elif self.use_mlp_decoder:
+                                    t_mlp_start = time.time()
                                     waypoint = self.waypoint_decoder(current_states_layer)
                                     waypoint = waypoint.reshape(-1, 2)
-                                    ego_fut_pred_layer = waypoint.to('cpu')
+                                    t_mlp = (time.time() - t_mlp_start) * 1000
+                                    ego_fut_pred_layer = waypoint  # 保持在GPU上
+                                    t_predict = (time.time() - t_predict_start) * 1000
                                 else:
                                     # 对于diff_decoder，暂时跳过early exit
                                     return False
                                 
-                                # 计算L2 2s metrics
+                                # 计算L2 2s metrics（直接在GPU上计算，只计算2s）
+                                t_l2_start = time.time()
+                                l2_2s = None
                                 if ego_fut_trajs_gt is not None and fut_valid_flag:
-                                    metric_dict_layer = self.compute_planner_metric_stp3(
-                                        pred_ego_fut_trajs=ego_fut_pred_layer[None].to('cpu'),
-                                        gt_ego_fut_trajs=ego_fut_trajs_gt[None].to('cpu'),
-                                        gt_agent_boxes=gt_bbox_for_metric,
-                                        gt_agent_feats=gt_attr_label_for_metric,
-                                        fut_valid_flag=fut_valid_flag
-                                    )
-                                    l2_2s = metric_dict_layer.get('plan_L2_2s', float('inf'))
-                                    l2_1s = metric_dict_layer.get('plan_L2_1s', float('inf'))
-                                    l2_3s = metric_dict_layer.get('plan_L2_3s', float('inf'))
+                                    # 只计算2秒（4个时间步）的L2距离
+                                    pred_traj_2s = ego_fut_pred_layer[:4] if ego_fut_pred_layer.shape[0] >= 4 else ego_fut_pred_layer
+                                    gt_traj_2s = ego_fut_trajs_gt[:4] if ego_fut_trajs_gt.shape[0] >= 4 else ego_fut_trajs_gt
                                     
-                                    # 打印当前层的metrics分数
-                                    current_layer_num = layer_idx + 1  # layer_idx从0开始
-                                    print(f"[Early Exit] Layer {current_layer_num}: L2_1s={l2_1s:.4f}, L2_2s={l2_2s:.4f}, L2_3s={l2_3s:.4f}, threshold={early_exit_threshold:.4f}")
+                                    # 确保在同一个设备上
+                                    if pred_traj_2s.device != gt_traj_2s.device:
+                                        gt_traj_2s = gt_traj_2s.to(pred_traj_2s.device)
                                     
-                                    # 如果L2 2s < threshold，则early exit
-                                    if l2_2s < early_exit_threshold:
-                                        print(f"[Early Exit] ✓ Triggered at Layer {current_layer_num}! L2_2s={l2_2s:.4f} < {early_exit_threshold:.4f}")
-                                        early_exit_result['triggered'] = True
-                                        early_exit_result['ego_feature'] = ego_feature_layer
-                                        early_exit_result['layer_idx'] = layer_idx
-                                        if not self.use_mlp_decoder:
-                                            early_exit_result['ego_fut_preds'] = ego_fut_preds_layer  # 保持完整格式
-                                        else:
-                                            early_exit_result['ego_fut_preds'] = waypoint
-                                        return True  # 触发early exit
+                                    min_len = min(pred_traj_2s.shape[0], gt_traj_2s.shape[0])
+                                    # 直接在GPU上计算L2距离
+                                    l2_2s = torch.sqrt(((pred_traj_2s[:min_len] - gt_traj_2s[:min_len]) ** 2).sum(dim=-1)).mean().item()
+                                t_l2 = (time.time() - t_l2_start) * 1000
+                                
+                                # 打印当前层的详细耗时
+                                layer_total = (time.time() - layer_start_time) * 1000
+                                if not self.use_mlp_decoder:
+                                    l2_str = f"L2_2s: {l2_2s:.4f}" if l2_2s is not None else "L2_2s: N/A"
+                                    print(f"[Layer {layer_idx+1} Timing] Total: {layer_total:.2f}ms | Extract: {t_extract:.2f}ms | Dist: {t_dist:.2f}ms | Future: {t_fut:.2f}ms | Decoder: {t_dec:.2f}ms | L2: {t_l2:.2f}ms | {l2_str}")
+                                else:
+                                    l2_str = f"L2_2s: {l2_2s:.4f}" if l2_2s is not None else "L2_2s: N/A"
+                                    print(f"[Layer {layer_idx+1} Timing] Total: {layer_total:.2f}ms | Extract: {t_extract:.2f}ms | MLP: {t_mlp:.2f}ms | L2: {t_l2:.2f}ms | {l2_str}")
+                                
+                                # 如果没有计算L2_2s，直接返回
+                                if l2_2s is None:
+                                    skip_until_layer[0] = self.lm_head.config.num_hidden_layers - 1 
+                                    return False
+                                
+                                # 记录是否触发了跳层
+                                triggered_skip = False
+                                
+                                # 智能跳过机制：根据L2_2s与阈值的倍数，动态调整跳过的层数
+                                # 多级跳过策略：L2_2s越大，跳过的层数越多
+                                if l2_2s > early_exit_threshold * 10.0:
+                                    # 如果L2_2s > 阈值 × 10，跳过后续15层（非常差，几乎不可能early exit）
+                                    skip_until_layer[0] = min(layer_idx + 15, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 7.0:
+                                    # 如果L2_2s > 阈值 × 7，跳过后续12层
+                                    skip_until_layer[0] = min(layer_idx + 12, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 5.0:
+                                    # 如果L2_2s > 阈值 × 5，跳过后续10层
+                                    skip_until_layer[0] = min(layer_idx + 10, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 4.0:
+                                    # 如果L2_2s > 阈值 × 4，跳过后续8层
+                                    skip_until_layer[0] = min(layer_idx + 8, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 3.0:
+                                    # 如果L2_2s > 阈值 × 3，跳过后续6层
+                                    skip_until_layer[0] = min(layer_idx + 6, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 2.5:
+                                    # 如果L2_2s > 阈值 × 2.5，跳过后续5层
+                                    skip_until_layer[0] = min(layer_idx + 5, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 2.0:
+                                    # 如果L2_2s > 阈值 × 2.0，跳过后续3层（轻微跳过）
+                                    skip_until_layer[0] = min(layer_idx + 3, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                
+                                # 如果L2_2s接近阈值（≤ 阈值 × 1.8），清除跳过标记，继续正常检查
+                                if skip_until_layer[0] is not None and l2_2s <= early_exit_threshold * 1.8:
+                                    skip_until_layer[0] = None
+                                
+                                # 如果L2 2s < threshold，则early exit
+                                if l2_2s < early_exit_threshold:
+                                    early_exit_result['triggered'] = True
+                                    early_exit_result['ego_feature'] = ego_feature_layer
+                                    early_exit_result['layer_idx'] = layer_idx
+                                    if not self.use_mlp_decoder:
+                                        early_exit_result['ego_fut_preds'] = ego_fut_preds_layer
+                                    else:
+                                        early_exit_result['ego_fut_preds'] = waypoint
+                                    return True  # 触发early exit
+                                
+                                # 如果不满足阈值（L2_2s > threshold）且没有触发跳层
+                                if l2_2s > early_exit_threshold and not triggered_skip:
+                                    consecutive_no_skip_above_threshold[0] += 1
+                                    # 如果连续3层都不满足阈值且无跳层，说明metrics已稳定在较低水平，直接跳到最后一层
+                                    if consecutive_no_skip_above_threshold[0] >= 3:
+                                        skip_until_layer[0] = self.lm_head.config.num_hidden_layers - 1  # 跳到最后一层（32层）
+                                        return False
+                                # 如果不满足阈值但触发了跳层，清零计数器
+                                elif l2_2s > early_exit_threshold and triggered_skip:
+                                    consecutive_no_skip_above_threshold[0] = 0
+                                    
                                 return False
-                            except Exception as e:
+                            except Exception:
                                 # 如果计算metrics失败，继续下一层
-                                print(f"[Early Exit] Warning: Failed to compute metrics for Layer {layer_idx + 1}: {str(e)}")
                                 return False
                         
                         # 设置回调函数
@@ -970,6 +1061,7 @@ class Orion(MVXTwoStageDetector):
                         llama_model.early_exit_start_layer = early_exit_start_layer
                         
                         # 调用inference_ego，模型会在forward过程中逐层检查并可能提前退出
+                        t_inference_start = time.time()
                         ego_feature = self.lm_head.inference_ego(
                             inputs=context_input_ids,
                             images=vision_embeded,
@@ -981,6 +1073,8 @@ class Orion(MVXTwoStageDetector):
                             use_cache=False,  # early exit时不需要cache
                             return_ego_feature=True
                         )
+                        t_inference = (time.time() - t_inference_start) * 1000
+                        print(f"[Timing] Inference EGO: {t_inference:.2f}ms")
                         
                         # 清除回调函数
                         if hasattr(self.lm_head, 'get_model'):
@@ -993,16 +1087,21 @@ class Orion(MVXTwoStageDetector):
                         if early_exit_result['triggered']:
                             ego_feature = early_exit_result['ego_feature']
                             ego_fut_preds = early_exit_result['ego_fut_preds']
+                            exit_layer = early_exit_result['layer_idx'] + 1
+                            case_end_time = time.time()
+                            case_time_ms = (case_end_time - case_start_time) * 1000
+                            print(f"[Case] Early Exit at Layer {exit_layer}, Time: {case_time_ms:.2f}ms")
                         else:
-                            # 没有触发early exit，使用最后一层的输出
-                            final_layer_num = self.lm_head.config.num_hidden_layers
-                            print(f"[Early Exit] ✗ Not triggered, using final layer {final_layer_num}")
+                            # 没有触发early exit，使用最后一层的输出，直接生成预测
+                            exit_layer = self.lm_head.config.num_hidden_layers
+                            t_no_exit_start = time.time()
                             # ego_feature已经是最后一层的输出，需要生成预测
                             current_states = ego_feature.unsqueeze(1)
                             if not self.use_diff_decoder and not self.use_mlp_decoder:  # VAE-based generate
                                 distribution_comp = {}
                                 noise = None
                                 self.fut_ts = 6
+                                t_no_exit_dist_start = time.time()
                                 if self.PROBABILISTIC:
                                     sample, output_distribution = self.distribution_forward(
                                         current_states, None, noise
@@ -1010,23 +1109,38 @@ class Orion(MVXTwoStageDetector):
                                     distribution_comp = {**distribution_comp, **output_distribution}
                                 else:
                                     sample = current_states
+                                t_no_exit_dist = (time.time() - t_no_exit_dist_start) * 1000
 
                                 hidden_states = ego_feature.unsqueeze(1)
+                                t_no_exit_fut_start = time.time()
                                 states_hs, future_states_hs = \
                                     self.future_states_predict(B, sample, hidden_states, current_states)
+                                t_no_exit_fut = (time.time() - t_no_exit_fut_start) * 1000
 
                                 ego_query_hs = \
                                     states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
                                 ego_fut_trajs_list = []
+                                t_no_exit_dec_start = time.time()
                                 for i in range(self.fut_ts):
                                     outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
                                     ego_fut_trajs_list.append(outputs_ego_trajs)
+                                t_no_exit_dec = (time.time() - t_no_exit_dec_start) * 1000
 
                                 ego_fut_preds = torch.stack(ego_fut_trajs_list, dim=2)
+                                t_no_exit_total = (time.time() - t_no_exit_start) * 1000
+                                print(f"[Timing] No Exit Generate - Total: {t_no_exit_total:.2f}ms | Dist: {t_no_exit_dist:.2f}ms | Future: {t_no_exit_fut:.2f}ms | Decoder: {t_no_exit_dec:.2f}ms")
                             elif self.use_mlp_decoder:
+                                t_no_exit_mlp_start = time.time()
                                 waypoint = self.waypoint_decoder(current_states)
                                 waypoint = waypoint.reshape(-1, 2)
+                                t_no_exit_mlp = (time.time() - t_no_exit_mlp_start) * 1000
                                 ego_fut_preds = waypoint
+                                t_no_exit_total = (time.time() - t_no_exit_start) * 1000
+                                print(f"[Timing] No Exit Generate - Total: {t_no_exit_total:.2f}ms | MLP: {t_no_exit_mlp:.2f}ms")
+                            
+                            case_end_time = time.time()
+                            case_time_ms = (case_end_time - case_start_time) * 1000
+                            print(f"[Case] No Early Exit (Layer {exit_layer}), Time: {case_time_ms:.2f}ms")
                     else:
                         # 不使用early exit，使用原有逻辑
                         ego_feature = self.lm_head.inference_ego(
