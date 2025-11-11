@@ -783,7 +783,7 @@ class Orion(MVXTwoStageDetector):
                     
                     # Early exit: 从第16层开始逐层评估，使用回调机制实现真正的early exit
                     enable_early_exit = not (self.fp16_infer or self.fp32_infer) or self.fp16_eval  # 只在评估模式下启用
-                    early_exit_threshold = 0.5  # L2 2s metrics阈值
+                    early_exit_threshold = 2  # L2 2s metrics阈值
                     early_exit_start_layer = 16  # 从第16层开始
                     
                     # 用于存储early exit的结果
@@ -796,6 +796,12 @@ class Orion(MVXTwoStageDetector):
                     
                     if enable_early_exit:
                         case_start_time = time.time()
+                        
+                        # 初始化统计变量（如果不存在）
+                        if not hasattr(self, '_inference_times'):
+                            self._inference_times = []
+                        if not hasattr(self, '_exit_layers'):
+                            self._exit_layers = []
                         
                         # 准备ground truth用于计算metrics（保持在GPU上，避免CPU-GPU传输）
                         if not (self.fp16_infer or self.fp32_infer) or self.fp16_eval:
@@ -838,7 +844,6 @@ class Orion(MVXTwoStageDetector):
                         # 定义early exit回调函数
                         def early_exit_callback(hidden_states, layer_idx):
                             """回调函数：在每一层后检查是否应该early exit"""
-                            layer_start_time = time.time()
                             
                             # 只从第16层开始检查
                             if layer_idx < early_exit_start_layer - 1:
@@ -850,7 +855,6 @@ class Orion(MVXTwoStageDetector):
                             
                             try:
                                 # 提取ego feature
-                                t_extract_start = time.time()
                                 # 确保loc_positions的形状与hidden_states匹配
                                 batch_size, seq_len, _ = hidden_states.shape
                                 if loc_positions.shape[1] != seq_len:
@@ -883,60 +887,47 @@ class Orion(MVXTwoStageDetector):
                                 selected_hidden_states = hidden_states[loc_positions_to_use.to(device=hidden_states.device)]
                                 ego_feature_layer = selected_hidden_states.to(torch.float32)
                                 current_states_layer = ego_feature_layer.unsqueeze(1)
-                                t_extract = (time.time() - t_extract_start) * 1000
                                 
                                 # 生成预测轨迹
-                                t_predict_start = time.time()
                                 if not self.use_diff_decoder and not self.use_mlp_decoder:  # VAE-based generate
                                     distribution_comp = {}
                                     noise = None
                                     self.fut_ts = 6
-                                    t_dist_start = time.time()
                                     if self.PROBABILISTIC:
                                         sample, output_distribution = self.distribution_forward(
                                             current_states_layer, None, noise
                                         )
                                     else:
                                         sample = current_states_layer
-                                    t_dist = (time.time() - t_dist_start) * 1000
 
                                     # 2. predict future state from distribution
                                     # 确保所有输入都是float32类型，避免dtype不匹配
                                     hidden_states_hs = ego_feature_layer.unsqueeze(1).to(torch.float32)
                                     sample = sample.to(torch.float32) if sample is not None else current_states_layer.to(torch.float32)
                                     current_states_layer = current_states_layer.to(torch.float32)
-                                    t_fut_start = time.time()
                                     states_hs, future_states_hs = \
                                         self.future_states_predict(B, sample, hidden_states_hs, current_states_layer)
-                                    t_fut = (time.time() - t_fut_start) * 1000
 
                                     ego_query_hs = \
                                         states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
                                     ego_fut_trajs_list = []
-                                    t_dec_start = time.time()
                                     for i in range(self.fut_ts):
                                         outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
                                         ego_fut_trajs_list.append(outputs_ego_trajs)
-                                    t_dec = (time.time() - t_dec_start) * 1000
 
                                     ego_fut_preds_layer = torch.stack(ego_fut_trajs_list, dim=2)  # (B, ego_fut_mode, fut_ts, 2)
                                     mask_active_cmd = data['ego_fut_cmd'][:,0,0] == 1
                                     ego_fut_preds_layer_filtered = ego_fut_preds_layer[mask_active_cmd].flatten(0,1)
                                     ego_fut_pred_layer = ego_fut_preds_layer_filtered.cumsum(dim=-2)  # 保持在GPU上
-                                    t_predict = (time.time() - t_predict_start) * 1000
                                 elif self.use_mlp_decoder:
-                                    t_mlp_start = time.time()
                                     waypoint = self.waypoint_decoder(current_states_layer)
                                     waypoint = waypoint.reshape(-1, 2)
-                                    t_mlp = (time.time() - t_mlp_start) * 1000
                                     ego_fut_pred_layer = waypoint  # 保持在GPU上
-                                    t_predict = (time.time() - t_predict_start) * 1000
                                 else:
                                     # 对于diff_decoder，暂时跳过early exit
                                     return False
                                 
                                 # 计算L2 2s metrics（直接在GPU上计算，只计算2s）
-                                t_l2_start = time.time()
                                 l2_2s = None
                                 if ego_fut_trajs_gt is not None and fut_valid_flag:
                                     # 只计算2秒（4个时间步）的L2距离
@@ -950,16 +941,6 @@ class Orion(MVXTwoStageDetector):
                                     min_len = min(pred_traj_2s.shape[0], gt_traj_2s.shape[0])
                                     # 直接在GPU上计算L2距离
                                     l2_2s = torch.sqrt(((pred_traj_2s[:min_len] - gt_traj_2s[:min_len]) ** 2).sum(dim=-1)).mean().item()
-                                t_l2 = (time.time() - t_l2_start) * 1000
-                                
-                                # 打印当前层的详细耗时
-                                layer_total = (time.time() - layer_start_time) * 1000
-                                if not self.use_mlp_decoder:
-                                    l2_str = f"L2_2s: {l2_2s:.4f}" if l2_2s is not None else "L2_2s: N/A"
-                                    print(f"[Layer {layer_idx+1} Timing] Total: {layer_total:.2f}ms | Extract: {t_extract:.2f}ms | Dist: {t_dist:.2f}ms | Future: {t_fut:.2f}ms | Decoder: {t_dec:.2f}ms | L2: {t_l2:.2f}ms | {l2_str}")
-                                else:
-                                    l2_str = f"L2_2s: {l2_2s:.4f}" if l2_2s is not None else "L2_2s: N/A"
-                                    print(f"[Layer {layer_idx+1} Timing] Total: {layer_total:.2f}ms | Extract: {t_extract:.2f}ms | MLP: {t_mlp:.2f}ms | L2: {t_l2:.2f}ms | {l2_str}")
                                 
                                 # 如果没有计算L2_2s，直接返回
                                 if l2_2s is None:
@@ -1061,7 +1042,7 @@ class Orion(MVXTwoStageDetector):
                         llama_model.early_exit_start_layer = early_exit_start_layer
                         
                         # 调用inference_ego，模型会在forward过程中逐层检查并可能提前退出
-                        t_inference_start = time.time()
+                        inference_start_time = time.time()
                         ego_feature = self.lm_head.inference_ego(
                             inputs=context_input_ids,
                             images=vision_embeded,
@@ -1073,8 +1054,8 @@ class Orion(MVXTwoStageDetector):
                             use_cache=False,  # early exit时不需要cache
                             return_ego_feature=True
                         )
-                        t_inference = (time.time() - t_inference_start) * 1000
-                        print(f"[Timing] Inference EGO: {t_inference:.2f}ms")
+                        inference_time = (time.time() - inference_start_time) * 1000  # 转换为毫秒
+                        self._inference_times.append(inference_time)
                         
                         # 清除回调函数
                         if hasattr(self.lm_head, 'get_model'):
@@ -1088,20 +1069,21 @@ class Orion(MVXTwoStageDetector):
                             ego_feature = early_exit_result['ego_feature']
                             ego_fut_preds = early_exit_result['ego_fut_preds']
                             exit_layer = early_exit_result['layer_idx'] + 1
-                            case_end_time = time.time()
-                            case_time_ms = (case_end_time - case_start_time) * 1000
-                            print(f"[Case] Early Exit at Layer {exit_layer}, Time: {case_time_ms:.2f}ms")
                         else:
                             # 没有触发early exit，使用最后一层的输出，直接生成预测
                             exit_layer = self.lm_head.config.num_hidden_layers
-                            t_no_exit_start = time.time()
+                        
+                        # 记录退出层
+                        self._exit_layers.append(exit_layer)
+                        
+                        # 如果没有触发early exit，需要生成预测
+                        if not early_exit_result['triggered']:
                             # ego_feature已经是最后一层的输出，需要生成预测
                             current_states = ego_feature.unsqueeze(1)
                             if not self.use_diff_decoder and not self.use_mlp_decoder:  # VAE-based generate
                                 distribution_comp = {}
                                 noise = None
                                 self.fut_ts = 6
-                                t_no_exit_dist_start = time.time()
                                 if self.PROBABILISTIC:
                                     sample, output_distribution = self.distribution_forward(
                                         current_states, None, noise
@@ -1109,38 +1091,23 @@ class Orion(MVXTwoStageDetector):
                                     distribution_comp = {**distribution_comp, **output_distribution}
                                 else:
                                     sample = current_states
-                                t_no_exit_dist = (time.time() - t_no_exit_dist_start) * 1000
 
                                 hidden_states = ego_feature.unsqueeze(1)
-                                t_no_exit_fut_start = time.time()
                                 states_hs, future_states_hs = \
                                     self.future_states_predict(B, sample, hidden_states, current_states)
-                                t_no_exit_fut = (time.time() - t_no_exit_fut_start) * 1000
 
                                 ego_query_hs = \
                                     states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
                                 ego_fut_trajs_list = []
-                                t_no_exit_dec_start = time.time()
                                 for i in range(self.fut_ts):
                                     outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
                                     ego_fut_trajs_list.append(outputs_ego_trajs)
-                                t_no_exit_dec = (time.time() - t_no_exit_dec_start) * 1000
 
                                 ego_fut_preds = torch.stack(ego_fut_trajs_list, dim=2)
-                                t_no_exit_total = (time.time() - t_no_exit_start) * 1000
-                                print(f"[Timing] No Exit Generate - Total: {t_no_exit_total:.2f}ms | Dist: {t_no_exit_dist:.2f}ms | Future: {t_no_exit_fut:.2f}ms | Decoder: {t_no_exit_dec:.2f}ms")
                             elif self.use_mlp_decoder:
-                                t_no_exit_mlp_start = time.time()
                                 waypoint = self.waypoint_decoder(current_states)
                                 waypoint = waypoint.reshape(-1, 2)
-                                t_no_exit_mlp = (time.time() - t_no_exit_mlp_start) * 1000
                                 ego_fut_preds = waypoint
-                                t_no_exit_total = (time.time() - t_no_exit_start) * 1000
-                                print(f"[Timing] No Exit Generate - Total: {t_no_exit_total:.2f}ms | MLP: {t_no_exit_mlp:.2f}ms")
-                            
-                            case_end_time = time.time()
-                            case_time_ms = (case_end_time - case_start_time) * 1000
-                            print(f"[Case] No Early Exit (Layer {exit_layer}), Time: {case_time_ms:.2f}ms")
                     else:
                         # 不使用early exit，使用原有逻辑
                         ego_feature = self.lm_head.inference_ego(
@@ -1320,6 +1287,36 @@ class Orion(MVXTwoStageDetector):
                 lane_results[0]['fut_valid_flag'] = fut_valid_flag if not self.qa_pretrain else False
 
         return bbox_results, generated_text, lane_results, metric_dict
+    
+    def print_final_inference_stats(self):
+        """打印所有case的最终统计信息（推理时间和退出层分布）"""
+        if hasattr(self, '_exit_layers') and len(self._exit_layers) > 0:
+            from collections import Counter
+            exit_layer_counter = Counter(self._exit_layers)
+            
+            # 计算平均推理时间
+            avg_inference_time = sum(self._inference_times) / len(self._inference_times) if self._inference_times else 0.0
+            
+            print("\n" + "="*80)
+            print("[Final Statistics]")
+            print("="*80)
+            
+            # 打印平均推理时间
+            print(f"\nAverage Inference Time: {avg_inference_time:.2f}ms")
+            print(f"Total Cases: {len(self._exit_layers)}")
+            
+            # 打印退出层分布（数量和比例）
+            print("\nExit Layer Distribution:")
+            for layer in sorted(exit_layer_counter.keys()):
+                count = exit_layer_counter[layer]
+                percentage = count / len(self._exit_layers) * 100
+                print(f"  Layer {layer}: {count} cases ({percentage:.1f}%)")
+            
+            print("="*80 + "\n")
+            
+            # 清空统计信息，准备下一批
+            self._inference_times = []
+            self._exit_layers = []
     
     def simple_test(self, img_metas, **data):
         """Test function without augmentaiton."""

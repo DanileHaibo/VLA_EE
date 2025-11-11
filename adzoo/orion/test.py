@@ -158,8 +158,7 @@ def main():
         distributed = False
     else:
         distributed = True
-        init_dist(args.launcher, **cfg.dist_params)
-
+        init_dist(args.launcher, **cfg.dist_params)     
     # set random seeds
     if args.seed is not None:
         set_random_seed(args.seed, deterministic=args.deterministic)
@@ -209,10 +208,11 @@ def main():
         outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
                                         args.gpu_collect)
 
-
-
     rank, _ = get_dist_info()
     if rank == 0:
+        # 输出推理统计信息（分布式情况下）
+        if hasattr(model.module, 'print_final_inference_stats'):
+            model.module.print_final_inference_stats()
         if args.out:
             print(f'\nwriting results to {args.out}')
         kwargs = {} if args.eval_options is None else args.eval_options
