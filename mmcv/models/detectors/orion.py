@@ -783,8 +783,8 @@ class Orion(MVXTwoStageDetector):
                     
                     # Early exit: 从第16层开始逐层评估，使用回调机制实现真正的early exit
                     enable_early_exit = not (self.fp16_infer or self.fp32_infer) or self.fp16_eval  # 只在评估模式下启用
-                    early_exit_threshold = 2  # L2 2s metrics阈值
-                    early_exit_start_layer = 16  # 从第16层开始
+                    early_exit_threshold = 0.1  # L2 2s metrics阈值
+                    early_exit_start_layer = 1  # 从第16层开始
                     
                     # 用于存储early exit的结果
                     early_exit_result = {
@@ -793,6 +793,9 @@ class Orion(MVXTwoStageDetector):
                         'ego_fut_preds': None,
                         'layer_idx': None
                     }
+                    
+                    # 用于记录14-16层的L2_2s值
+                    l2_14_16 = {}  # {layer: l2_value}
                     
                     if enable_early_exit:
                         case_start_time = time.time()
@@ -812,9 +815,9 @@ class Orion(MVXTwoStageDetector):
                             ego_fut_trajs_gt = None
                         
                         # 智能跳过机制：记录跳过层数，用于跳过远大于阈值的层
-                        skip_until_layer = [None]  # 使用列表以便在闭包中修改
+                        # skip_until_layer = [None]  # 使用列表以便在闭包中修改 - 已注释：禁用多跳机制
                         # 连续不满足阈值且无跳层的计数（用于避免metrics已降到最低，继续检查也无提升的情况）
-                        consecutive_no_skip_above_threshold = [0]  # 使用列表以便在闭包中修改
+                        # consecutive_no_skip_above_threshold = [0]  # 使用列表以便在闭包中修改 - 已注释：禁用多跳机制
                         
                         # 先调用prepare_inputs_labels_for_multimodal获取new_input_ids，用于在回调中计算loc_positions
                         # 这样loc_positions的形状就能匹配hidden_states的实际形状
@@ -845,13 +848,17 @@ class Orion(MVXTwoStageDetector):
                         def early_exit_callback(hidden_states, layer_idx):
                             """回调函数：在每一层后检查是否应该early exit"""
                             
-                            # 只从第16层开始检查
-                            if layer_idx < early_exit_start_layer - 1:
-                                return False
+                            # # 只从第16层开始检查
+                            # if layer_idx < early_exit_start_layer - 1:
+                            #     return False
                             
                             # 智能跳过：如果设置了跳过层，且当前层小于跳过层，直接返回
-                            if skip_until_layer[0] is not None and layer_idx < skip_until_layer[0]:
-                                return False
+                            # if skip_until_layer[0] is not None and layer_idx < skip_until_layer[0]:
+                            #     return False
+                            # 已注释：禁用多跳机制
+                            
+                            current_layer = layer_idx + 1  # layer_idx从0开始，实际层数从1开始
+                            print(f"[Layer {current_layer:2d}] ", end="")
                             
                             try:
                                 # 提取ego feature
@@ -944,56 +951,67 @@ class Orion(MVXTwoStageDetector):
                                 
                                 # 如果没有计算L2_2s，直接返回
                                 if l2_2s is None:
-                                    skip_until_layer[0] = self.lm_head.config.num_hidden_layers - 1 
+                                    # skip_until_layer[0] = self.lm_head.config.num_hidden_layers - 1  # 已注释：禁用多跳机制
+                                    print(f"L2_2s: None (no GT or invalid)")
                                     return False
                                 
+                                # 打印L2_2s值
+                                print(f"L2_2s: {l2_2s:.4f}, threshold: {early_exit_threshold:.4f}", end="")
+                                
+                                # 记录14-16层的L2_2s值（用于筛选符合条件的case）
+                                if 14 <= current_layer <= 16:
+                                    l2_14_16[current_layer] = l2_2s
+                                
                                 # 记录是否触发了跳层
-                                triggered_skip = False
+                                # triggered_skip = False  # 已注释：禁用多跳机制
                                 
                                 # 智能跳过机制：根据L2_2s与阈值的倍数，动态调整跳过的层数
                                 # 多级跳过策略：L2_2s越大，跳过的层数越多
-                                if l2_2s > early_exit_threshold * 10.0:
-                                    # 如果L2_2s > 阈值 × 10，跳过后续15层（非常差，几乎不可能early exit）
-                                    skip_until_layer[0] = min(layer_idx + 15, self.lm_head.config.num_hidden_layers - 1)
-                                    triggered_skip = True
-                                    return False
-                                elif l2_2s > early_exit_threshold * 7.0:
-                                    # 如果L2_2s > 阈值 × 7，跳过后续12层
-                                    skip_until_layer[0] = min(layer_idx + 12, self.lm_head.config.num_hidden_layers - 1)
-                                    triggered_skip = True
-                                    return False
-                                elif l2_2s > early_exit_threshold * 5.0:
-                                    # 如果L2_2s > 阈值 × 5，跳过后续10层
-                                    skip_until_layer[0] = min(layer_idx + 10, self.lm_head.config.num_hidden_layers - 1)
-                                    triggered_skip = True
-                                    return False
-                                elif l2_2s > early_exit_threshold * 4.0:
-                                    # 如果L2_2s > 阈值 × 4，跳过后续8层
-                                    skip_until_layer[0] = min(layer_idx + 8, self.lm_head.config.num_hidden_layers - 1)
-                                    triggered_skip = True
-                                    return False
-                                elif l2_2s > early_exit_threshold * 3.0:
-                                    # 如果L2_2s > 阈值 × 3，跳过后续6层
-                                    skip_until_layer[0] = min(layer_idx + 6, self.lm_head.config.num_hidden_layers - 1)
-                                    triggered_skip = True
-                                    return False
-                                elif l2_2s > early_exit_threshold * 2.5:
-                                    # 如果L2_2s > 阈值 × 2.5，跳过后续5层
-                                    skip_until_layer[0] = min(layer_idx + 5, self.lm_head.config.num_hidden_layers - 1)
-                                    triggered_skip = True
-                                    return False
-                                elif l2_2s > early_exit_threshold * 2.0:
-                                    # 如果L2_2s > 阈值 × 2.0，跳过后续3层（轻微跳过）
-                                    skip_until_layer[0] = min(layer_idx + 3, self.lm_head.config.num_hidden_layers - 1)
-                                    triggered_skip = True
-                                    return False
+                                # 已注释：禁用多跳机制，逐层检查
+                                # if l2_2s > early_exit_threshold * 10.0:
+                                #     # 如果L2_2s > 阈值 × 10，跳过后续15层（非常差，几乎不可能early exit）
+                                #     skip_until_layer[0] = min(layer_idx + 15, self.lm_head.config.num_hidden_layers - 1)
+                                #     triggered_skip = True
+                                #     return False
+                                # elif l2_2s > early_exit_threshold * 7.0:
+                                #     # 如果L2_2s > 阈值 × 7，跳过后续12层
+                                #     skip_until_layer[0] = min(layer_idx + 12, self.lm_head.config.num_hidden_layers - 1)
+                                #     triggered_skip = True
+                                #     return False
+                                # elif l2_2s > early_exit_threshold * 5.0:
+                                #     # 如果L2_2s > 阈值 × 5，跳过后续10层
+                                #     skip_until_layer[0] = min(layer_idx + 10, self.lm_head.config.num_hidden_layers - 1)
+                                #     triggered_skip = True
+                                #     return False
+                                # elif l2_2s > early_exit_threshold * 4.0:
+                                #     # 如果L2_2s > 阈值 × 4，跳过后续8层
+                                #     skip_until_layer[0] = min(layer_idx + 8, self.lm_head.config.num_hidden_layers - 1)
+                                #     triggered_skip = True
+                                #     return False
+                                # elif l2_2s > early_exit_threshold * 3.0:
+                                #     # 如果L2_2s > 阈值 × 3，跳过后续6层
+                                #     skip_until_layer[0] = min(layer_idx + 6, self.lm_head.config.num_hidden_layers - 1)
+                                #     triggered_skip = True
+                                #     return False
+                                # elif l2_2s > early_exit_threshold * 2.5:
+                                #     # 如果L2_2s > 阈值 × 2.5，跳过后续5层
+                                #     skip_until_layer[0] = min(layer_idx + 5, self.lm_head.config.num_hidden_layers - 1)
+                                #     triggered_skip = True
+                                #     return False
+                                # elif l2_2s > early_exit_threshold * 2.0:
+                                #     # 如果L2_2s > 阈值 × 2.0，跳过后续3层（轻微跳过）
+                                #     skip_until_layer[0] = min(layer_idx + 3, self.lm_head.config.num_hidden_layers - 1)
+                                #     triggered_skip = True
+                                #     return False
                                 
                                 # 如果L2_2s接近阈值（≤ 阈值 × 1.8），清除跳过标记，继续正常检查
-                                if skip_until_layer[0] is not None and l2_2s <= early_exit_threshold * 1.8:
-                                    skip_until_layer[0] = None
+                                # if skip_until_layer[0] is not None and l2_2s <= early_exit_threshold * 1.8:
+                                #     skip_until_layer[0] = None
+                                # 已注释：禁用多跳机制
                                 
                                 # 如果L2 2s < threshold，则early exit
                                 if l2_2s < early_exit_threshold:
+                                    print(f" -> EARLY EXIT triggered!")
                                     early_exit_result['triggered'] = True
                                     early_exit_result['ego_feature'] = ego_feature_layer
                                     early_exit_result['layer_idx'] = layer_idx
@@ -1004,19 +1022,22 @@ class Orion(MVXTwoStageDetector):
                                     return True  # 触发early exit
                                 
                                 # 如果不满足阈值（L2_2s > threshold）且没有触发跳层
-                                if l2_2s > early_exit_threshold and not triggered_skip:
-                                    consecutive_no_skip_above_threshold[0] += 1
-                                    # 如果连续3层都不满足阈值且无跳层，说明metrics已稳定在较低水平，直接跳到最后一层
-                                    if consecutive_no_skip_above_threshold[0] >= 3:
-                                        skip_until_layer[0] = self.lm_head.config.num_hidden_layers - 1  # 跳到最后一层（32层）
-                                        return False
-                                # 如果不满足阈值但触发了跳层，清零计数器
-                                elif l2_2s > early_exit_threshold and triggered_skip:
-                                    consecutive_no_skip_above_threshold[0] = 0
-                                    
+                                # if l2_2s > early_exit_threshold and not triggered_skip:
+                                #     consecutive_no_skip_above_threshold[0] += 1
+                                #     # 如果连续3层都不满足阈值且无跳层，说明metrics已稳定在较低水平，直接跳到最后一层
+                                #     if consecutive_no_skip_above_threshold[0] >= 3:
+                                #         skip_until_layer[0] = self.lm_head.config.num_hidden_layers - 1  # 跳到最后一层（32层）
+                                #         return False
+                                # # 如果不满足阈值但触发了跳层，清零计数器
+                                # elif l2_2s > early_exit_threshold and triggered_skip:
+                                #     consecutive_no_skip_above_threshold[0] = 0
+                                # 已注释：禁用多跳机制
+                                
+                                print(f" -> continue")  # 继续下一层
                                 return False
-                            except Exception:
+                            except Exception as e:
                                 # 如果计算metrics失败，继续下一层
+                                print(f"Error: {str(e)} -> continue")
                                 return False
                         
                         # 设置回调函数
@@ -1075,6 +1096,22 @@ class Orion(MVXTwoStageDetector):
                         
                         # 记录退出层
                         self._exit_layers.append(exit_layer)
+                        
+                        # 检查14-16层是否有低于2m的case
+                        if l2_14_16:
+                            min_l2_in_14_16 = min(l2_14_16.values())
+                            if min_l2_in_14_16 < 2.0:
+                                # 找到符合条件的case，打印详细信息
+                                print(f"\n{'='*80}")
+                                print(f"[Found Case with L2_2s < 2m in layers 14-16]")
+                                print(f"{'='*80}")
+                                print(f"Case Index: {len(self._exit_layers) - 1}")
+                                print(f"L2_2s values in layers 14-16:")
+                                for layer in sorted(l2_14_16.keys()):
+                                    print(f"  Layer {layer}: {l2_14_16[layer]:.4f}m")
+                                print(f"Minimum L2_2s in layers 14-16: {min_l2_in_14_16:.4f}m")
+                                print(f"Exit Layer: {exit_layer}")
+                                print(f"{'='*80}\n")
                         
                         # 如果没有触发early exit，需要生成预测
                         if not early_exit_result['triggered']:
@@ -1305,12 +1342,13 @@ class Orion(MVXTwoStageDetector):
             print(f"\nAverage Inference Time: {avg_inference_time:.2f}ms")
             print(f"Total Cases: {len(self._exit_layers)}")
             
-            # 打印退出层分布（数量和比例）
-            print("\nExit Layer Distribution:")
-            for layer in sorted(exit_layer_counter.keys()):
-                count = exit_layer_counter[layer]
-                percentage = count / len(self._exit_layers) * 100
-                print(f"  Layer {layer}: {count} cases ({percentage:.1f}%)")
+            # 打印退出层分布（数量和比例）- 显示1-32层的完整统计
+            print("\nExit Layer Distribution (1-32):")
+            total_cases = len(self._exit_layers)
+            for layer in range(1, 33):  # 1到32层
+                count = exit_layer_counter.get(layer, 0)
+                percentage = count / total_cases * 100 if total_cases > 0 else 0.0
+                print(f"  Layer {layer:2d}: {count:5d} cases ({percentage:5.1f}%)")
             
             print("="*80 + "\n")
             
