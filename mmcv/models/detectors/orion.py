@@ -55,13 +55,13 @@ from mmcv.models.utils import  DistributionModule, PredictModel,  \
                                 CustomTransformerDecoder, CustomTransformerDecoderLayer, SinusoidalPosEmb, gen_sineembed_for_position, \
                                     linear_relu_ln, py_sigmoid_focal_loss
 from mmcv.models.bricks import Linear
-from mmcv.models.builder import HEADS 
+from mmcv.models.builder import HEADS
 import pickle
 from diffusers.schedulers import DDIMScheduler
 import matplotlib.pyplot as plt
 from mmcv.utils.misc import memory_refresh
 from mmcv.models.utils import build_transformer
-from mmcv.models.builder import HEADS, build_loss 
+from mmcv.models.builder import HEADS, build_loss
 
 @DETECTORS.register_module()
 class Orion(MVXTwoStageDetector):
@@ -167,10 +167,10 @@ class Orion(MVXTwoStageDetector):
             self.tokenizer.pad_token = self.tokenizer.unk_token
         else:
             self.tokenizer = None
-        
+
         self.position_range = nn.Parameter(torch.tensor(
             position_range), requires_grad=False)
-        
+
         if LID:
             index  = torch.arange(start=0, end=depth_num, step=1).float()
             index_1 = index + 1
@@ -188,7 +188,7 @@ class Orion(MVXTwoStageDetector):
                 nn.ReLU(),
                 nn.Linear(embed_dims*4, embed_dims),
             )
-        
+
         use_critical_qa = use_critical_qa or qa_pretrain
         self.qa_pretrain = qa_pretrain
         if lm_head is not None:
@@ -197,7 +197,7 @@ class Orion(MVXTwoStageDetector):
         if use_gen_token:
             add_special_token([EGO_WAYPOINT_TOKEN], tokenizer = self.tokenizer, model = self.lm_head)
             self.lm_head.config.waypoint_token_idx = self.tokenizer(EGO_WAYPOINT_TOKEN, add_special_tokens=False).input_ids[0]
-        
+
         self.use_gen_token = use_gen_token
         self.use_diff_decoder = use_diff_decoder
         self.use_mlp_decoder = use_mlp_decoder
@@ -253,7 +253,7 @@ class Orion(MVXTwoStageDetector):
                     self.loss_plan_col = build_loss(loss_plan_col)
                 # self.loss_plan_dir = build_loss(loss_plan_dir)
                 self.loss_vae_gen = build_loss(loss_vae_gen)
-            
+
             elif self.use_diff_decoder:
                 self.plan_cls_loss_smooth = plan_cls_loss_smooth
                 self.diff_loss_weight = diff_loss_weight
@@ -295,7 +295,7 @@ class Orion(MVXTwoStageDetector):
                     beta_schedule="scaled_linear",
                     prediction_type="sample",
                 )
-            elif self.use_mlp_decoder: 
+            elif self.use_mlp_decoder:
                 self.waypoint_decoder = nn.Sequential(
                     nn.Linear(4096, 4096 // 2),
                     nn.GELU(),
@@ -320,13 +320,13 @@ class Orion(MVXTwoStageDetector):
         """bool: Whether the detector has a map head."""
         return hasattr(self,
                        'map_head') and self.map_head is not None
-        
+
     @property
     def with_lm_head(self):
         """bool: Whether the detector has a lm head."""
         return hasattr(self,
                        'lm_head') and self.lm_head is not None
-        
+
     # @auto_fp16(apply_to=('img'), out_fp32=True)
     def extract_img_feat(self, img):
         """Extract features of images."""
@@ -411,11 +411,59 @@ class Orion(MVXTwoStageDetector):
         coords3d = torch.matmul(img2lidars, coords).squeeze(-1)[..., :3]
         coords3d[..., 0:3] = (coords3d[..., 0:3] - self.position_range[0:3]) / (self.position_range[3:6] - self.position_range[0:3])
         coords3d = coords3d.reshape(B, -1, D*3)
-      
+
         pos_embed  = inverse_sigmoid(coords3d)
         coords_position_embeding = self.position_encoder(pos_embed)
 
         return coords_position_embeding
+
+    def _apply_nav_reference_perturbation(self, traj):
+        """Perturb the reference trajectory used only for early-exit decisions."""
+        mode = os.environ.get('ORION_NAV_PERTURB_MODE', 'none').lower()
+        if mode in ('', 'none', 'baseline'):
+            return traj
+
+        value = float(os.environ.get('ORION_NAV_PERTURB_VALUE', '0'))
+        if value == 0:
+            return traj
+
+        if mode == 'gaussian':
+            seed = int(os.environ.get('ORION_NAV_PERTURB_SEED', '2026'))
+            counter = getattr(self, '_nav_perturb_counter', 0)
+            self._nav_perturb_counter = counter + 1
+            generator = torch.Generator(device=traj.device)
+            generator.manual_seed(seed + counter)
+            return traj + torch.randn(traj.shape, generator=generator, device=traj.device, dtype=traj.dtype) * value
+
+        if mode == 'lateral':
+            direction = traj[-1] - traj[0]
+            norm = torch.norm(direction) + 1e-6
+            normal = torch.stack((-direction[1], direction[0])) / norm
+            return traj + normal.view(1, 2) * value
+
+        if mode == 'time_shift':
+            shift = int(round(value))
+            idx = torch.arange(traj.shape[0], device=traj.device) + shift
+            idx = torch.clamp(idx, 0, traj.shape[0] - 1)
+            return traj[idx]
+
+        if mode == 'sparse':
+            step = max(1, int(round(value)))
+            if step <= 1 or traj.shape[0] <= 2:
+                return traj
+            n = traj.shape[0]
+            keep = list(range(0, n, step))
+            if keep[-1] != n - 1:
+                keep.append(n - 1)
+            keep_t = torch.tensor(keep, device=traj.device, dtype=torch.long)
+            out = traj.clone()
+            for left, right in zip(keep[:-1], keep[1:]):
+                span = max(1, right - left)
+                alpha = torch.arange(span + 1, device=traj.device, dtype=traj.dtype).view(-1, 1) / span
+                out[left:right + 1] = traj[left] * (1 - alpha) + traj[right] * alpha
+            return out
+
+        raise ValueError(f'Unsupported ORION_NAV_PERTURB_MODE={mode}')
 
     # @force_fp32(apply_to=('img'))
     def forward(self, data, return_loss=True):
@@ -437,7 +485,7 @@ class Orion(MVXTwoStageDetector):
             return outputs
         else:
             return self.forward_test(**data)
-        
+
     def forward_train(self,
                       img_metas=None,
                       gt_bboxes_3d=None,
@@ -480,11 +528,11 @@ class Orion(MVXTwoStageDetector):
                 input_ids, # [(76,)]
                 batch_first=True,
                 padding_value=self.tokenizer.pad_token_id) # (1, 76)
-            
+
             vlm_labels = torch.nn.utils.rnn.pad_sequence(vlm_labels, # [(76,)]
                                                     batch_first=True,
                                                     padding_value=IGNORE_INDEX) # (1, 76)
-            
+
             input_ids = input_ids[:, :self.tokenizer.model_max_length] # 2048
             vlm_labels = vlm_labels[:, :self.tokenizer.model_max_length] # 2048
             vlm_attn_mask = input_ids.ne(self.tokenizer.pad_token_id) # (1, 76)
@@ -506,10 +554,10 @@ class Orion(MVXTwoStageDetector):
                           gt_labels_3d,
                           gt_attr_labels,
                           map_gt_bboxes_3d,
-                          map_gt_labels_3d,   
+                          map_gt_labels_3d,
                           img_metas,
-                          input_ids, 
-                          vlm_labels, 
+                          input_ids,
+                          vlm_labels,
                           vlm_attn_mask,
                           ego_fut_trajs,
                           **data):
@@ -543,7 +591,7 @@ class Orion(MVXTwoStageDetector):
             else:
                 loss = self.pts_bbox_head.loss(*loss_inputs)
             losses.update(loss)
-            
+
         if self.with_map_head:
             outs_lane, map_query = self.map_head(img_metas, pos_embed, **data)
             vision_embeded_map = map_query.clone()
@@ -608,7 +656,7 @@ class Orion(MVXTwoStageDetector):
                         loss_plan_input = [ego_fut_preds, ego_fut_trajs[:,0], data['ego_fut_masks'][:,0,0], data['ego_fut_cmd'][:,0,0], lane_preds, lane_scores]
                     else:
                         loss_plan_input = [ego_fut_preds, ego_fut_trajs[:,0], data['ego_fut_masks'][:,0,0], data['ego_fut_cmd'][:,0,0]]
-                    
+
                     if self.use_col_loss:
                         loss_planning_dict = self.loss_planning(*loss_plan_input, **agent_outs)
                     else:
@@ -643,7 +691,7 @@ class Orion(MVXTwoStageDetector):
                     ego_fut_mode = noisy_traj_points.shape[1]
                     # 2. proj noisy_traj_points to the query
                     traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=512)
-                   
+
                     traj_pos_embed = traj_pos_embed.flatten(-2)
                     traj_feature = self.plan_anchor_encoder(traj_pos_embed)
                     traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
@@ -667,7 +715,7 @@ class Orion(MVXTwoStageDetector):
                         trajectory_loss_dict[f"traj_diff_loss_cls_{idx}"] = trajectory_cls_loss
                         trajectory_loss_dict[f"traj_diff_loss_reg_{idx}"] = trajectory_reg_loss
                         trajectory_loss_dict[f"traj_diff_loss_bound_{idx}"] = trajectory_bound_loss
-                        
+
                     losses.update(trajectory_loss_dict)
                 elif self.use_mlp_decoder:
                     waypoint = self.waypoint_decoder(current_states)
@@ -685,7 +733,7 @@ class Orion(MVXTwoStageDetector):
                 vlm_loss= self.lm_head(input_ids=input_ids, attention_mask=vlm_attn_mask, labels=vlm_labels, images=vision_embeded, use_cache=False)
                 losses.update(vlm_loss=vlm_loss[0])
         return losses
-    
+
     def forward_test(self, img_metas, **data):
         if not self.test_flag: #for interval evaluation
             if self.with_pts_bbox:
@@ -730,8 +778,8 @@ class Orion(MVXTwoStageDetector):
                     outs, img_metas)
                 for bboxes, scores, labels in bbox_list:
                     bbox_results.append(bbox3d2result(bboxes, scores, labels))
-        
-        lane_results = None 
+
+        lane_results = None
         if self.with_map_head:
             outs, map_query = self.map_head(img_metas, pos_embed, **data)
             vision_embeded_map = map_query.clone()
@@ -761,7 +809,7 @@ class Orion(MVXTwoStageDetector):
                     # metric_dict = self.compute_motion_metric_vip3d(
                     #         gt_bbox, gt_label, gt_attr_label, bbox_result,
                     #         matched_bbox_result, mapped_class_names)
-            
+
         if self.with_lm_head:
             history_input_output_id = []
             vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1) # (1, 513, 4096)
@@ -780,12 +828,15 @@ class Orion(MVXTwoStageDetector):
                 if self.use_gen_token and special_token_inputs: # must be the final round conversation
                     history_input_output_id.append(input_ids)
                     context_input_ids = torch.cat(history_input_output_id,dim=-1)
-                    
+
                     # Early exit: 从第16层开始逐层评估，使用回调机制实现真正的early exit
                     enable_early_exit = not (self.fp16_infer or self.fp32_infer) or self.fp16_eval  # 只在评估模式下启用
-                    early_exit_threshold = 0.1  # L2 2s metrics阈值
+                    if os.environ.get('ORION_NAV_PERTURB_MODE', '').lower() == 'disable_ee':
+                        enable_early_exit = False
+                    early_exit_threshold = 0.5  # L2 2s metrics阈值
                     early_exit_start_layer = 1  # 从第16层开始
-                    
+                    log_ee_layers = os.environ.get('ORION_EE_LOG_LAYERS', '1') != '0'
+
                     # 用于存储early exit的结果
                     early_exit_result = {
                         'triggered': False,
@@ -793,32 +844,34 @@ class Orion(MVXTwoStageDetector):
                         'ego_fut_preds': None,
                         'layer_idx': None
                     }
-                    
+                    exit_layer = self.lm_head.config.num_hidden_layers
+
                     # 用于记录14-16层的L2_2s值
                     l2_14_16 = {}  # {layer: l2_value}
-                    
+
                     if enable_early_exit:
                         case_start_time = time.time()
-                        
+
                         # 初始化统计变量（如果不存在）
                         if not hasattr(self, '_inference_times'):
                             self._inference_times = []
                         if not hasattr(self, '_exit_layers'):
                             self._exit_layers = []
-                        
+
                         # 准备ground truth用于计算metrics（保持在GPU上，避免CPU-GPU传输）
                         if not (self.fp16_infer or self.fp32_infer) or self.fp16_eval:
                             ego_fut_trajs_gt = data['ego_fut_trajs'][0, 0].cumsum(dim=-2) if fut_valid_flag else None
                             if ego_fut_trajs_gt is not None:
                                 ego_fut_trajs_gt = ego_fut_trajs_gt.to(device=vision_embeded.device)
+                                ego_fut_trajs_gt = self._apply_nav_reference_perturbation(ego_fut_trajs_gt)
                         else:
                             ego_fut_trajs_gt = None
-                        
+
                         # 智能跳过机制：记录跳过层数，用于跳过远大于阈值的层
-                        # skip_until_layer = [None]  # 使用列表以便在闭包中修改 - 已注释：禁用多跳机制
+                        skip_until_layer = [None]
                         # 连续不满足阈值且无跳层的计数（用于避免metrics已降到最低，继续检查也无提升的情况）
                         # consecutive_no_skip_above_threshold = [0]  # 使用列表以便在闭包中修改 - 已注释：禁用多跳机制
-                        
+
                         # 先调用prepare_inputs_labels_for_multimodal获取new_input_ids，用于在回调中计算loc_positions
                         # 这样loc_positions的形状就能匹配hidden_states的实际形状
                         _, _, _, _, _, _, new_input_ids_for_callback = self.lm_head.prepare_inputs_labels_for_multimodal(
@@ -830,7 +883,7 @@ class Orion(MVXTwoStageDetector):
                             vision_embeded,
                             None   # image_sizes
                         )
-                        
+
                         # 获取waypoint token位置（基于new_input_ids，形状匹配hidden_states）
                         if not isinstance(self.lm_head.config.waypoint_token_idx, list):
                             loc_positions = (new_input_ids_for_callback == self.lm_head.config.waypoint_token_idx)
@@ -843,23 +896,23 @@ class Orion(MVXTwoStageDetector):
                                         loc_positions = torch.logical_or(loc_positions, new_id == token_id)
                                 loc_positions_list.append(loc_positions)
                             loc_positions = torch.stack(loc_positions_list, dim=0)
-                        
+
                         # 定义early exit回调函数
                         def early_exit_callback(hidden_states, layer_idx):
                             """回调函数：在每一层后检查是否应该early exit"""
-                            
+
                             # # 只从第16层开始检查
                             # if layer_idx < early_exit_start_layer - 1:
                             #     return False
-                            
-                            # 智能跳过：如果设置了跳过层，且当前层小于跳过层，直接返回
-                            # if skip_until_layer[0] is not None and layer_idx < skip_until_layer[0]:
-                            #     return False
-                            # 已注释：禁用多跳机制
-                            
+
+                            # 智能跳过：如果设置了跳过层，且当前层小于跳过层，则只跑 LLM forward，不做 probe/head/L2。
+                            if skip_until_layer[0] is not None and layer_idx < skip_until_layer[0]:
+                                return False
+
                             current_layer = layer_idx + 1  # layer_idx从0开始，实际层数从1开始
-                            print(f"[Layer {current_layer:2d}] ", end="")
-                            
+                            if log_ee_layers:
+                                print(f"[Layer {current_layer:2d}] ", end="")
+
                             try:
                                 # 提取ego feature
                                 # 确保loc_positions的形状与hidden_states匹配
@@ -881,7 +934,7 @@ class Orion(MVXTwoStageDetector):
                                     # 调整形状以匹配hidden_states
                                     if loc_positions_actual.shape[1] < seq_len:
                                         # 如果new_input_ids较短，需要padding
-                                        padding = torch.zeros((batch_size, seq_len - loc_positions_actual.shape[1]), 
+                                        padding = torch.zeros((batch_size, seq_len - loc_positions_actual.shape[1]),
                                                             dtype=torch.bool, device=loc_positions_actual.device)
                                         loc_positions_actual = torch.cat([loc_positions_actual, padding], dim=1)
                                     elif loc_positions_actual.shape[1] > seq_len:
@@ -890,11 +943,11 @@ class Orion(MVXTwoStageDetector):
                                     loc_positions_to_use = loc_positions_actual
                                 else:
                                     loc_positions_to_use = loc_positions
-                                
+
                                 selected_hidden_states = hidden_states[loc_positions_to_use.to(device=hidden_states.device)]
                                 ego_feature_layer = selected_hidden_states.to(torch.float32)
                                 current_states_layer = ego_feature_layer.unsqueeze(1)
-                                
+
                                 # 生成预测轨迹
                                 if not self.use_diff_decoder and not self.use_mlp_decoder:  # VAE-based generate
                                     distribution_comp = {}
@@ -933,85 +986,79 @@ class Orion(MVXTwoStageDetector):
                                 else:
                                     # 对于diff_decoder，暂时跳过early exit
                                     return False
-                                
+
                                 # 计算L2 2s metrics（直接在GPU上计算，只计算2s）
                                 l2_2s = None
                                 if ego_fut_trajs_gt is not None and fut_valid_flag:
                                     # 只计算2秒（4个时间步）的L2距离
                                     pred_traj_2s = ego_fut_pred_layer[:4] if ego_fut_pred_layer.shape[0] >= 4 else ego_fut_pred_layer
                                     gt_traj_2s = ego_fut_trajs_gt[:4] if ego_fut_trajs_gt.shape[0] >= 4 else ego_fut_trajs_gt
-                                    
+
                                     # 确保在同一个设备上
                                     if pred_traj_2s.device != gt_traj_2s.device:
                                         gt_traj_2s = gt_traj_2s.to(pred_traj_2s.device)
-                                    
+
                                     min_len = min(pred_traj_2s.shape[0], gt_traj_2s.shape[0])
                                     # 直接在GPU上计算L2距离
                                     l2_2s = torch.sqrt(((pred_traj_2s[:min_len] - gt_traj_2s[:min_len]) ** 2).sum(dim=-1)).mean().item()
-                                
+
                                 # 如果没有计算L2_2s，直接返回
                                 if l2_2s is None:
                                     # skip_until_layer[0] = self.lm_head.config.num_hidden_layers - 1  # 已注释：禁用多跳机制
-                                    print(f"L2_2s: None (no GT or invalid)")
+                                    if log_ee_layers:
+                                        print(f"L2_2s: None (no GT or invalid)")
                                     return False
-                                
+
                                 # 打印L2_2s值
-                                print(f"L2_2s: {l2_2s:.4f}, threshold: {early_exit_threshold:.4f}", end="")
-                                
+                                if log_ee_layers:
+                                    print(f"L2_2s: {l2_2s:.4f}, threshold: {early_exit_threshold:.4f}", end="")
+
                                 # 记录14-16层的L2_2s值（用于筛选符合条件的case）
                                 if 14 <= current_layer <= 16:
                                     l2_14_16[current_layer] = l2_2s
-                                
+
                                 # 记录是否触发了跳层
-                                # triggered_skip = False  # 已注释：禁用多跳机制
-                                
-                                # 智能跳过机制：根据L2_2s与阈值的倍数，动态调整跳过的层数
-                                # 多级跳过策略：L2_2s越大，跳过的层数越多
-                                # 已注释：禁用多跳机制，逐层检查
-                                # if l2_2s > early_exit_threshold * 10.0:
-                                #     # 如果L2_2s > 阈值 × 10，跳过后续15层（非常差，几乎不可能early exit）
-                                #     skip_until_layer[0] = min(layer_idx + 15, self.lm_head.config.num_hidden_layers - 1)
-                                #     triggered_skip = True
-                                #     return False
-                                # elif l2_2s > early_exit_threshold * 7.0:
-                                #     # 如果L2_2s > 阈值 × 7，跳过后续12层
-                                #     skip_until_layer[0] = min(layer_idx + 12, self.lm_head.config.num_hidden_layers - 1)
-                                #     triggered_skip = True
-                                #     return False
-                                # elif l2_2s > early_exit_threshold * 5.0:
-                                #     # 如果L2_2s > 阈值 × 5，跳过后续10层
-                                #     skip_until_layer[0] = min(layer_idx + 10, self.lm_head.config.num_hidden_layers - 1)
-                                #     triggered_skip = True
-                                #     return False
-                                # elif l2_2s > early_exit_threshold * 4.0:
-                                #     # 如果L2_2s > 阈值 × 4，跳过后续8层
-                                #     skip_until_layer[0] = min(layer_idx + 8, self.lm_head.config.num_hidden_layers - 1)
-                                #     triggered_skip = True
-                                #     return False
-                                # elif l2_2s > early_exit_threshold * 3.0:
-                                #     # 如果L2_2s > 阈值 × 3，跳过后续6层
-                                #     skip_until_layer[0] = min(layer_idx + 6, self.lm_head.config.num_hidden_layers - 1)
-                                #     triggered_skip = True
-                                #     return False
-                                # elif l2_2s > early_exit_threshold * 2.5:
-                                #     # 如果L2_2s > 阈值 × 2.5，跳过后续5层
-                                #     skip_until_layer[0] = min(layer_idx + 5, self.lm_head.config.num_hidden_layers - 1)
-                                #     triggered_skip = True
-                                #     return False
-                                # elif l2_2s > early_exit_threshold * 2.0:
-                                #     # 如果L2_2s > 阈值 × 2.0，跳过后续3层（轻微跳过）
-                                #     skip_until_layer[0] = min(layer_idx + 3, self.lm_head.config.num_hidden_layers - 1)
-                                #     triggered_skip = True
-                                #     return False
-                                
-                                # 如果L2_2s接近阈值（≤ 阈值 × 1.8），清除跳过标记，继续正常检查
-                                # if skip_until_layer[0] is not None and l2_2s <= early_exit_threshold * 1.8:
-                                #     skip_until_layer[0] = None
-                                # 已注释：禁用多跳机制
-                                
+                                triggered_skip = False
+
+                                # 智能跳过机制：根据L2_2s与阈值的倍数，动态调整跳过的层数。
+                                # 注意：这里跳过的是 probe/head/L2 检查，不跳过 LLM 层 forward。
+                                if l2_2s > early_exit_threshold * 10.0:
+                                    skip_until_layer[0] = min(layer_idx + 15, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 7.0:
+                                    skip_until_layer[0] = min(layer_idx + 12, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 5.0:
+                                    skip_until_layer[0] = min(layer_idx + 10, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 4.0:
+                                    skip_until_layer[0] = min(layer_idx + 8, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 3.0:
+                                    skip_until_layer[0] = min(layer_idx + 6, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 2.5:
+                                    skip_until_layer[0] = min(layer_idx + 5, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+                                elif l2_2s > early_exit_threshold * 2.0:
+                                    skip_until_layer[0] = min(layer_idx + 3, self.lm_head.config.num_hidden_layers - 1)
+                                    triggered_skip = True
+                                    return False
+
+                                # 如果L2_2s接近阈值（≤ 阈值 × 1.8），清除跳过标记，继续正常检查。
+                                if skip_until_layer[0] is not None and l2_2s <= early_exit_threshold * 1.8:
+                                    skip_until_layer[0] = None
+
                                 # 如果L2 2s < threshold，则early exit
                                 if l2_2s < early_exit_threshold:
-                                    print(f" -> EARLY EXIT triggered!")
+                                    if log_ee_layers:
+                                        print(f" -> EARLY EXIT triggered!")
                                     early_exit_result['triggered'] = True
                                     early_exit_result['ego_feature'] = ego_feature_layer
                                     early_exit_result['layer_idx'] = layer_idx
@@ -1020,26 +1067,16 @@ class Orion(MVXTwoStageDetector):
                                     else:
                                         early_exit_result['ego_fut_preds'] = waypoint
                                     return True  # 触发early exit
-                                
-                                # 如果不满足阈值（L2_2s > threshold）且没有触发跳层
-                                # if l2_2s > early_exit_threshold and not triggered_skip:
-                                #     consecutive_no_skip_above_threshold[0] += 1
-                                #     # 如果连续3层都不满足阈值且无跳层，说明metrics已稳定在较低水平，直接跳到最后一层
-                                #     if consecutive_no_skip_above_threshold[0] >= 3:
-                                #         skip_until_layer[0] = self.lm_head.config.num_hidden_layers - 1  # 跳到最后一层（32层）
-                                #         return False
-                                # # 如果不满足阈值但触发了跳层，清零计数器
-                                # elif l2_2s > early_exit_threshold and triggered_skip:
-                                #     consecutive_no_skip_above_threshold[0] = 0
-                                # 已注释：禁用多跳机制
-                                
-                                print(f" -> continue")  # 继续下一层
+
+                                if log_ee_layers:
+                                    print(f" -> continue")  # 继续下一层
                                 return False
                             except Exception as e:
                                 # 如果计算metrics失败，继续下一层
-                                print(f"Error: {str(e)} -> continue")
+                                if log_ee_layers:
+                                    print(f"Error: {str(e)} -> continue")
                                 return False
-                        
+
                         # 设置回调函数
                         # 获取底层的LlavaLlamaModel实例
                         if hasattr(self.lm_head, 'get_model'):
@@ -1048,20 +1085,20 @@ class Orion(MVXTwoStageDetector):
                             llama_model = self.lm_head.model
                         else:
                             raise AttributeError(f"self.lm_head ({type(self.lm_head)}) has neither 'get_model' nor 'model' attribute")
-                        
+
                         # 类型检查
                         from mmcv.utils.llava_llama import LlavaLlamaModel
                         if not isinstance(llama_model, LlavaLlamaModel):
                             raise TypeError(f"Expected LlavaLlamaModel, but got {type(llama_model)}. "
                                           f"self.lm_head type: {type(self.lm_head)}, "
                                           f"self.lm_head.model type: {type(getattr(self.lm_head, 'model', None))}")
-                        
+
                         if not hasattr(llama_model, 'set_early_exit_callback'):
                             raise AttributeError(f"LlavaLlamaModel {type(llama_model)} does not have set_early_exit_callback method.")
-                        
+
                         llama_model.set_early_exit_callback(early_exit_callback)
                         llama_model.early_exit_start_layer = early_exit_start_layer
-                        
+
                         # 调用inference_ego，模型会在forward过程中逐层检查并可能提前退出
                         inference_start_time = time.time()
                         ego_feature = self.lm_head.inference_ego(
@@ -1077,14 +1114,14 @@ class Orion(MVXTwoStageDetector):
                         )
                         inference_time = (time.time() - inference_start_time) * 1000  # 转换为毫秒
                         self._inference_times.append(inference_time)
-                        
+
                         # 清除回调函数
                         if hasattr(self.lm_head, 'get_model'):
                             llama_model = self.lm_head.get_model()
                         else:
                             llama_model = self.lm_head.model
                         llama_model.set_early_exit_callback(None)
-                        
+
                         # 如果触发了early exit，使用保存的结果
                         if early_exit_result['triggered']:
                             ego_feature = early_exit_result['ego_feature']
@@ -1093,12 +1130,12 @@ class Orion(MVXTwoStageDetector):
                         else:
                             # 没有触发early exit，使用最后一层的输出，直接生成预测
                             exit_layer = self.lm_head.config.num_hidden_layers
-                        
+
                         # 记录退出层
                         self._exit_layers.append(exit_layer)
-                        
+
                         # 检查14-16层是否有低于2m的case
-                        if l2_14_16:
+                        if log_ee_layers and l2_14_16:
                             min_l2_in_14_16 = min(l2_14_16.values())
                             if min_l2_in_14_16 < 2.0:
                                 # 找到符合条件的case，打印详细信息
@@ -1112,7 +1149,7 @@ class Orion(MVXTwoStageDetector):
                                 print(f"Minimum L2_2s in layers 14-16: {min_l2_in_14_16:.4f}m")
                                 print(f"Exit Layer: {exit_layer}")
                                 print(f"{'='*80}\n")
-                        
+
                         # 如果没有触发early exit，需要生成预测
                         if not early_exit_result['triggered']:
                             # ego_feature已经是最后一层的输出，需要生成预测
@@ -1160,7 +1197,7 @@ class Orion(MVXTwoStageDetector):
                         )
                         ego_feature = ego_feature.to(torch.float32)
                         current_states = ego_feature.unsqueeze(1)
-                        if not self.use_diff_decoder and not self.use_mlp_decoder: # VAE-based generate 
+                        if not self.use_diff_decoder and not self.use_mlp_decoder: # VAE-based generate
                             distribution_comp = {}
                             noise = None
                             self.fut_ts = 6
@@ -1217,7 +1254,7 @@ class Orion(MVXTwoStageDetector):
                                     timesteps = torch.tensor([timesteps], dtype=torch.long, device=img.device)
                                 elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
                                     timesteps = timesteps[None].to(img.device)
-                                
+
                                 # 3. embed the timesteps
                                 timesteps = timesteps.expand(img.shape[0])
                                 time_embed = self.time_mlp(timesteps)
@@ -1263,7 +1300,7 @@ class Orion(MVXTwoStageDetector):
                         A=self.tokenizer.batch_decode(output_ids, skip_special_tokens=True),
                     ))
                     history_input_output_id.append(output_ids)
- 
+
             full_match = False
             if not self.qa_pretrain:
                 if self.use_gen_token:
@@ -1296,7 +1333,7 @@ class Orion(MVXTwoStageDetector):
             if self.use_gen_token or full_match:
                 ego_fut_preds = ego_fut_preds.to(torch.float32) # for fp16 infer
                 if not self.use_diff_decoder:
-                    ego_fut_pred = ego_fut_preds.cumsum(dim=-2) 
+                    ego_fut_pred = ego_fut_preds.cumsum(dim=-2)
                 else:
                     ego_fut_pred = ego_fut_preds
                 if not (self.fp16_infer or self.fp32_infer) or self.fp16_eval:
@@ -1310,6 +1347,7 @@ class Orion(MVXTwoStageDetector):
                             fut_valid_flag = fut_valid_flag # 当前帧是否涵盖6个轨迹
                         )
                     metric_dict.update(metric_dict_planner_stp3)
+                    metric_dict['early_exit_layer'] = float(exit_layer)
                     lane_results[0]['fut_valid_flag'] = fut_valid_flag
                 else:
                     metric_dict.update({'fut_valid_flag': False})
@@ -1324,24 +1362,24 @@ class Orion(MVXTwoStageDetector):
                 lane_results[0]['fut_valid_flag'] = fut_valid_flag if not self.qa_pretrain else False
 
         return bbox_results, generated_text, lane_results, metric_dict
-    
+
     def print_final_inference_stats(self):
         """打印所有case的最终统计信息（推理时间和退出层分布）"""
         if hasattr(self, '_exit_layers') and len(self._exit_layers) > 0:
             from collections import Counter
             exit_layer_counter = Counter(self._exit_layers)
-            
+
             # 计算平均推理时间
             avg_inference_time = sum(self._inference_times) / len(self._inference_times) if self._inference_times else 0.0
-            
+
             print("\n" + "="*80)
             print("[Final Statistics]")
             print("="*80)
-            
+
             # 打印平均推理时间
             print(f"\nAverage Inference Time: {avg_inference_time:.2f}ms")
             print(f"Total Cases: {len(self._exit_layers)}")
-            
+
             # 打印退出层分布（数量和比例）- 显示1-32层的完整统计
             print("\nExit Layer Distribution (1-32):")
             total_cases = len(self._exit_layers)
@@ -1349,13 +1387,13 @@ class Orion(MVXTwoStageDetector):
                 count = exit_layer_counter.get(layer, 0)
                 percentage = count / total_cases * 100 if total_cases > 0 else 0.0
                 print(f"  Layer {layer:2d}: {count:5d} cases ({percentage:5.1f}%)")
-            
+
             print("="*80 + "\n")
-            
+
             # 清空统计信息，准备下一批
             self._inference_times = []
             self._exit_layers = []
-    
+
     def simple_test(self, img_metas, **data):
         """Test function without augmentaiton."""
         data['img_feats'] = self.extract_feat(data['img'])
@@ -1370,15 +1408,15 @@ class Orion(MVXTwoStageDetector):
             # print(result_dict['metric_results']['fut_valid_flag']) for debug
         bbox_list[0]['text_out'] = generated_text
         bbox_list[0]['pts_bbox'].update(lane_results[0])
-       
+
         return bbox_list
 
     def norm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
 
-        odo_info_fut_x = 2*(odo_info_fut_x + self.noise_x_offset)/self.noise_x_scale -1 
-        odo_info_fut_y = 2*(odo_info_fut_y + self.noise_y_offset)/self.noise_y_scale -1 
+        odo_info_fut_x = 2*(odo_info_fut_x + self.noise_x_offset)/self.noise_x_scale -1
+        odo_info_fut_y = 2*(odo_info_fut_y + self.noise_y_offset)/self.noise_y_scale -1
         return torch.cat([odo_info_fut_x, odo_info_fut_y], dim=-1)
 
     def denorm_odo(self, odo_info_fut):
@@ -1436,7 +1474,7 @@ class Orion(MVXTwoStageDetector):
                 metric_dict['plan_L2_{}s'.format(i+1)] = 0.0
                 metric_dict['plan_obj_col_{}s'.format(i+1)] = 0.0
                 metric_dict['plan_obj_box_col_{}s'.format(i+1)] = 0.0
-            
+
         return metric_dict
     def assign_pred_to_gt_vip3d(
         self,
@@ -1458,7 +1496,7 @@ class Orion(MVXTwoStageDetector):
 
         Returns:
             matched_bbox_result (np.array): assigned pred index for each gt box [num_gt_bbox].
-        """     
+        """
         dynamic_list = [0,1,3,4,6,7,8]
         matched_bbox_result = torch.ones(
             (len(gt_bbox)), dtype=torch.long) * -1  # -1: not assigned
@@ -1478,7 +1516,7 @@ class Orion(MVXTwoStageDetector):
                 matched_bbox_result[c_list[i]] = r_list[i]
 
         return matched_bbox_result
-    
+
     def compute_motion_metric_vip3d(
         self,
         gt_bbox,
@@ -1507,7 +1545,7 @@ class Orion(MVXTwoStageDetector):
         motion_cls_names = ['car', 'pedestrian']
         motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit',
                                'fp', 'ADE', 'FDE', 'MR']
-        
+
         metric_dict = {}
         for met in motion_metric_names:
             for cls in motion_cls_names:
@@ -1655,10 +1693,10 @@ class Orion(MVXTwoStageDetector):
             loss_plan_dict['loss_plan_bound'] = torch.nan_to_num(loss_plan_bound)
         if self.use_col_loss:
             loss_plan_dict['loss_plan_col'] = torch.nan_to_num(loss_plan_col)
-            
+
 
         return loss_plan_dict
-    
+
 
     def loss_planning_diffusion(self,
                       ego_fut_preds,
@@ -1694,7 +1732,7 @@ class Orion(MVXTwoStageDetector):
         target_classes_onehot.scatter_(1, cls_target.unsqueeze(1), 1)
 
         loss_plan_l1_weight = ego_fut_masks[:, :, None]
-        
+
         loss_plan_l1_weight = loss_plan_l1_weight.repeat(1,  1, 2)
 
         loss_plan_l1 = self.diff_traj_reg_loss_weight * self.loss_plan_reg(
@@ -1712,7 +1750,7 @@ class Orion(MVXTwoStageDetector):
                 denormalize=False,
             )
 
-        
+
         if self.plan_cls_loss_smooth:
             loss_plan_cls_weight = torch.clip(dist, min=0, max=10.)*10 # scale factor
             loss_plan_cls_weight[mode_masks] = 10.
@@ -1740,7 +1778,7 @@ class Orion(MVXTwoStageDetector):
             )
 
         return loss_cls, loss_plan_l1, loss_plan_bound
-    
+
     def get_future_labels(self, gt_labels_3d, gt_attr_labels, ego_fut_trajs, device):
 
         agent_dim = 300

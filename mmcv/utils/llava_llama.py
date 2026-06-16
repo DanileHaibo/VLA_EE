@@ -39,11 +39,11 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
         super(LlavaLlamaModel, self).__init__(config)
         self.early_exit_callback = None  # 用于early exit的回调函数
         self.early_exit_start_layer = 16  # 从第16层开始检查
-    
+
     def set_early_exit_callback(self, callback):
         """设置early exit回调函数，callback(hidden_states, layer_idx) -> bool，返回True表示应该early exit"""
         self.early_exit_callback = callback
-    
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -58,7 +58,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
     ):
         """重写forward方法，支持early exit"""
         from transformers.modeling_outputs import BaseModelOutputWithPast
-        
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -94,16 +94,23 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        
+
         if attention_mask is None:
             attention_mask = torch.ones(
                 (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
             )
-        attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+        cache_position = torch.arange(
+            past_key_values_length,
+            past_key_values_length + seq_length,
+            dtype=torch.long,
+            device=inputs_embeds.device,
+        )
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
 
         hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -138,11 +145,13 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
                 )
 
             hidden_states = layer_outputs[0]
@@ -152,7 +161,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-            
+
             # Early exit检查：从第16层开始，每层后检查
             if self.early_exit_callback is not None and idx >= self.early_exit_start_layer - 1:
                 if self.early_exit_callback(hidden_states, idx):
@@ -337,7 +346,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
             )
-       
+
 
     @torch.no_grad()
     def generate(
@@ -415,7 +424,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
             new_input_ids = inputs
-        
+
         output_attentions = self.config.output_attentions
         output_hidden_states = self.config.output_hidden_states
         return_dict = self.config.use_return_dict
@@ -452,7 +461,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             return selected_hidden_states
         else:
             assert False
-        
+
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
                                       inputs_embeds=None, **kwargs):

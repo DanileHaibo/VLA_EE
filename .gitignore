@@ -33,3 +33,12 @@ ckpts/
 .dist_test/
 *.pdf
 *.png
+work_dirs/
+*.log
+*.out
+*.time
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.safetensors
