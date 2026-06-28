@@ -162,7 +162,11 @@ num_epochs = 6
 llm_path = 'ckpts/pretrain_qformer/'
 use_gen_token = True
 use_col_loss = True
-collect_keys = ['lidar2img', 'cam_intrinsic', 'timestamp', 'ego_pose', 'ego_pose_inv', 'command']
+collect_keys = [
+    'lidar2img', 'cam_intrinsic', 'timestamp', 'ego_pose', 'ego_pose_inv',
+    'command', 'command_near_xy', 'temporal_shift_ref_trajs',
+    'temporal_shift_ref_masks'
+]
 # pretrain = True
 
 input_modality = dict(

@@ -278,6 +278,11 @@ class B2DOrionDataset(Custom3DDataset):
         input_dict['ego_fut_masks'] = ego_fut_masks
         input_dict['ego_fut_cmd'] = command
         input_dict['command'] = command_nohot
+        command_near_xy = np.array([info['command_near_xy'][0], info['command_near_xy'][1], 0.0, 1.0])
+        input_dict['command_near_xy'] = (info['sensors']['LIDAR_TOP']['world2lidar'] @ command_near_xy.T)[0:2].astype(np.float32)
+        temporal_refs, temporal_masks = self.get_temporal_shift_refs(index, self.sample_interval, self.future_frames)
+        input_dict['temporal_shift_ref_trajs'] = temporal_refs
+        input_dict['temporal_shift_ref_masks'] = temporal_masks
         input_dict['ego_lcf_feat'] = ego_lcf_feat
         input_dict['fut_valid_flag'] = (ego_fut_masks==1).all() 
 
@@ -436,6 +441,40 @@ class B2DOrionDataset(Custom3DDataset):
         command = self.command2hot(cur_frame['command_near'])
         command_nohot = self.command2nohot(cur_frame['command_near'])
         return offset_track[:past_frames].copy(), offset_track[past_frames:].copy(), full_adj_adj_mask[-future_frames:].copy(), command,command_nohot
+
+    def get_temporal_shift_refs(self, idx, sample_rate, future_frames, min_shift=-8, max_shift=8):
+        """Build contiguous-frame references for shifted EE decisions.
+
+        Shift s returns positions at future indices [1+s, ..., future_frames+s]
+        in the current lidar frame. Invalid route-boundary windows are marked
+        false and should fall back to the unshifted reference.
+        """
+        cur_frame = self.data_infos[idx]
+        world2lidar_lidar_cur = cur_frame['sensors']['LIDAR_TOP']['world2lidar']
+        shifts = list(range(min_shift, max_shift + 1))
+        refs = np.zeros((len(shifts), future_frames, 2), dtype=np.float32)
+        masks = np.zeros((len(shifts),), dtype=np.float32)
+
+        for shift_idx, shift in enumerate(shifts):
+            valid = True
+            points = []
+            for fut_idx in range(future_frames):
+                adj_idx = idx + (fut_idx + 1 + shift) * sample_rate
+                if adj_idx < 0 or adj_idx >= len(self.data_infos):
+                    valid = False
+                    break
+                adj_frame = self.data_infos[adj_idx]
+                if adj_frame['folder'] != cur_frame['folder']:
+                    valid = False
+                    break
+                world2lidar_ego_adj = adj_frame['sensors']['LIDAR_TOP']['world2lidar']
+                adj2cur_lidar = world2lidar_lidar_cur @ np.linalg.inv(world2lidar_ego_adj)
+                points.append(adj2cur_lidar[0:2, 3].astype(np.float32))
+            if valid:
+                refs[shift_idx] = np.stack(points, axis=0)
+                masks[shift_idx] = 1.0
+
+        return refs, masks
     
     def command2hot(self,command,max_dim=6):
         if command < 0:
@@ -831,7 +870,9 @@ class B2DOrionDataset(Custom3DDataset):
                  result_names=['pts_bbox'],
                  show=False,
                  out_dir=None,
-                 pipeline=None):
+                 pipeline=None,
+                 eval_indices=None,
+                 eval_meta_file=None):
         """Evaluation in nuScenes protocol.
 
         Args:
@@ -857,9 +898,17 @@ class B2DOrionDataset(Custom3DDataset):
         # NOTE: print planning metric
         print('\n')
         print('-------------- Planning --------------')
+        if eval_indices is None and eval_meta_file:
+            with open(eval_meta_file, encoding='utf-8') as _mf:
+                eval_indices = json.load(_mf).get('eval_indices')
         metric_dict = None
         num_valid = 0
-        for res in results:
+        num_targets = 0
+        eval_index_set = set(eval_indices) if eval_indices is not None else None
+        for i, res in enumerate(results):
+            if eval_index_set is not None and i not in eval_index_set:
+                continue
+            num_targets += 1
             if res['metric_results']['fut_valid_flag']:
                 num_valid += 1
             else:
@@ -870,9 +919,18 @@ class B2DOrionDataset(Custom3DDataset):
                 for k in res['metric_results'].keys():
                     metric_dict[k] += res['metric_results'][k]
         
-        for k in metric_dict:
-            metric_dict[k] = metric_dict[k] / num_valid
-            print("{}:{}".format(k, metric_dict[k]))
+        if metric_dict is None or num_valid == 0:
+            print(
+                'WARNING: no samples with fut_valid_flag=True; '
+                'planning metrics skipped (targets=%d). Use a scene-contiguous '
+                'ann_file (see scripts/build_contiguous_eval_pkl.py).'
+                % num_targets
+            )
+        else:
+            print('Planning metrics over %d/%d fut-valid targets' % (num_valid, num_targets))
+            for k in metric_dict:
+                metric_dict[k] = metric_dict[k] / num_valid
+                print("{}:{}".format(k, metric_dict[k]))
 
         if isinstance(result_files, dict):
             results_dict = dict()

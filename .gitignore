@@ -1,0 +1,44 @@
+# Python
+*.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Compiled files
+*.o
+*.so
+*.a
+
+# Build directories
+build/
+dist/
+*.egg-info/
+
+# Data files
+data/
+*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+ckpts/
+
+.dist_test/
+*.pdf
+*.png
+work_dirs/
+*.log
+*.out
+*.time
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.safetensors
